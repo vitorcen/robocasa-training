@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>训练 ACT 策略：RoboCasa OpenCabinet (Train ACT for OpenCabinet)</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+         max-width: 1040px; margin: 32px auto; padding: 24px;
+         background: #ffffff; color: #1f2328;
+         line-height: 1.65; }
+  html { background: #ffffff; }
+  h1 { border-bottom: 2px solid #1f2328; padding-bottom: 8px; }
+  h2 { margin-top: 2em; border-left: 4px solid #4c8bf5; padding-left: 12px; }
+  h3 { margin-top: 1.6em; color: #4c8bf5; }
+  h4 { margin-top: 1.2em; color: #57606a; }
+  .tldr { background: #fff8c5; border-left: 4px solid #d4a017;
+          padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
+  .tldr-en { color: #57606a; font-style: italic; margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left;
+           vertical-align: top; }
+  th { background: #f6f8fa; }
+  tr.recommend { background: #dafbe1; }
+  tr.recommend td:first-child::after { content: " ✨"; }
+  code { background: #f6f8fa; padding: 1px 5px; border-radius: 3px;
+         font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.9em; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto;
+        font-size: 0.88em; }
+  .note { background: #ddf4ff; border-left: 4px solid #0969da;
+          padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .warn { background: #ffebe9; border-left: 4px solid #cf222e;
+          padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .ok   { background: #dafbe1; border-left: 4px solid #1a7f37;
+          padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .meta { color: #57606a; font-size: 0.9em; }
+  svg  { display: block; margin: 16px auto; max-width: 100%; }
+  ul   { padding-left: 22px; }
+  li   { margin: 4px 0; }
+  .en  { color: #57606a; font-size: 0.85em; }
+  .kbd { background: #eaeef2; border: 1px solid #d0d7de; border-bottom-width: 2px;
+         border-radius: 4px; padding: 1px 6px; font-family: monospace; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<h1>训练 ACT 策略 ── RoboCasa OpenCabinet 开柜子任务</h1>
+<p class="meta">2026-05-29 · Linus 模式 · <code>robocasa-training</code> 仓库训练流水线总览</p>
+
+<div class="tldr">
+<strong>TL;DR</strong>：在本仓里跑 <strong>ACT (Action Chunking Transformer)</strong> 训 RoboCasa <code>OpenCabinet</code>。路径：用 robocasa 演示生成器在 <code>~/.cache/robocasa</code> 录 200-500 条 HDF5 演示 → 转 LeRobot dataset → LeRobot trainer 跑 ACT（chunk=100, batch=8, lr=1e-5）→ 接 ZMQ 推理 server 复用现有 RoboCasa 评估流水线（同 GR00T 客户端代码路径）。<strong>单 H800 ¥9/h × 12 h ≈ ¥108 / 任务</strong>，先开柜子，跑通后再扩到 18 atomic 任务。
+<div class="tldr-en">Train ACT on RoboCasa OpenCabinet: collect 200-500 HDF5 demos via robocasa's generator → convert to LeRobot format → train ACT (chunk=100, bs=8, lr=1e-5) via LeRobot → wrap with a ZMQ server reusing the existing RoboCasa eval client. ~¥108/task on a single H800 (12 h). Start with cabinet open, then scale to all 18 atomic tasks.</div>
+</div>
+
+<h2>1. 为什么是 ACT (Why ACT)</h2>
+
+<table>
+  <thead>
+    <tr><th>策略</th><th>规模</th><th>训练成本</th><th>OpenCabinet 适配度</th><th>本仓定位</th></tr>
+  </thead>
+  <tbody>
+    <tr class="recommend">
+      <td>ACT (Action Chunking Transformer)</td>
+      <td>~80 M 参数</td>
+      <td>单 GPU · 半天</td>
+      <td>视觉 + 关节状态原生输入；chunk 输出抗抖动</td>
+      <td><strong>本仓默认 baseline</strong></td>
+    </tr>
+    <tr>
+      <td>Diffusion Policy</td>
+      <td>~250 M</td>
+      <td>单 GPU · 1-2 天</td>
+      <td>对长程任务好，对 OpenCabinet 略奢侈</td>
+      <td>下一阶段对比组</td>
+    </tr>
+    <tr>
+      <td>GR00T N1.5 / pi0.5</td>
+      <td>2-3 B (VLA)</td>
+      <td>多 GPU · 数天</td>
+      <td>泛化好，但成本与本仓单任务目标不匹配</td>
+      <td>评估端复用官方 ckpt（见 <code>RoboCasa.ipynb</code>）</td>
+    </tr>
+    <tr>
+      <td>SmolVLA</td>
+      <td>~450 M</td>
+      <td>单 GPU · 1 天</td>
+      <td>VLA 小型化，需 lerobot dataset</td>
+      <td>对照训练组</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>Linus 判断</strong>：单任务 200 演示，ACT 80 M 是品味正确的选项 — 比 diffusion policy 简单、比 VLA 便宜、推理端只输出动作 chunk，<strong>直接复用 <code>scripts/_gr00t_eval_client.py</code> 的 ZMQ + action-chunk replay 协议，零修改</strong>。<span class="en">Reuses the existing GR00T eval client wire format verbatim — no special-casing.</span></div>
+
+<h2>2. 整体流水线 (Pipeline Overview)</h2>
+
+<svg viewBox="0 0 980 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ACT training pipeline">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <style>
+      .box { fill:#f6f8fa; stroke:#1f2328; stroke-width:1.5; }
+      .box-rec { fill:#dafbe1; stroke:#1a7f37; stroke-width:2; }
+      .box-warn { fill:#fff8c5; stroke:#d4a017; stroke-width:1.5; }
+      .title { font:bold 14px -apple-system, sans-serif; fill:#1f2328; }
+      .sub   { font:11px -apple-system, sans-serif; fill:#57606a; }
+      .arrow { stroke:#1f2328; stroke-width:1.5; fill:none; marker-end:url(#arr); }
+      .grp   { font:bold 12px -apple-system, sans-serif; fill:#4c8bf5; }
+    </style>
+  </defs>
+
+  <text x="20" y="30" class="grp">阶段 1 · 演示采集 (Data)</text>
+  <rect x="20" y="50" width="180" height="80" class="box" rx="6"/>
+  <text x="110" y="78" text-anchor="middle" class="title">RoboCasa env</text>
+  <text x="110" y="100" text-anchor="middle" class="sub">robocasa.generate_demos</text>
+  <text x="110" y="118" text-anchor="middle" class="sub">--task OpenCabinet --n 500</text>
+
+  <path class="arrow" d="M205,90 L255,90"/>
+
+  <rect x="260" y="50" width="180" height="80" class="box" rx="6"/>
+  <text x="350" y="78" text-anchor="middle" class="title">HDF5 演示</text>
+  <text x="350" y="100" text-anchor="middle" class="sub">~/.cache/robocasa/demos/</text>
+  <text x="350" y="118" text-anchor="middle" class="sub">3 cam + state + action</text>
+
+  <text x="500" y="30" class="grp">阶段 2 · 格式转换 (Convert)</text>
+  <path class="arrow" d="M445,90 L495,90"/>
+
+  <rect x="500" y="50" width="200" height="80" class="box-warn" rx="6"/>
+  <text x="600" y="78" text-anchor="middle" class="title">scripts/convert_to_lerobot.py</text>
+  <text x="600" y="100" text-anchor="middle" class="sub">HDF5 → LeRobotDataset</text>
+  <text x="600" y="118" text-anchor="middle" class="sub">写到 ~/.cache/huggingface/lerobot</text>
+
+  <path class="arrow" d="M705,90 L755,90"/>
+  <rect x="760" y="50" width="200" height="80" class="box" rx="6"/>
+  <text x="860" y="78" text-anchor="middle" class="title">LeRobotDataset</text>
+  <text x="860" y="100" text-anchor="middle" class="sub">images/state/action arrays</text>
+  <text x="860" y="118" text-anchor="middle" class="sub">parquet + videos shard</text>
+
+  <text x="20" y="170" class="grp">阶段 3 · 训练 (Train)</text>
+  <path class="arrow" d="M860,135 L860,180 L600,180 L600,205"/>
+
+  <rect x="500" y="210" width="200" height="80" class="box-rec" rx="6"/>
+  <text x="600" y="238" text-anchor="middle" class="title">lerobot train act</text>
+  <text x="600" y="260" text-anchor="middle" class="sub">chunk=100, bs=8, lr=1e-5</text>
+  <text x="600" y="278" text-anchor="middle" class="sub">~100k steps, 单 H800 ≈ 12h</text>
+
+  <path class="arrow" d="M495,250 L445,250"/>
+  <rect x="260" y="210" width="180" height="80" class="box" rx="6"/>
+  <text x="350" y="238" text-anchor="middle" class="title">ckpt 输出</text>
+  <text x="350" y="260" text-anchor="middle" class="sub">checkpoints/act_opencab/</text>
+  <text x="350" y="278" text-anchor="middle" class="sub">model.safetensors + config.json</text>
+
+  <text x="20" y="320" class="grp">阶段 4 · 评估 (Eval)</text>
+  <path class="arrow" d="M260,250 L205,250 L205,295"/>
+
+  <rect x="20" y="300" width="180" height="50" class="box-rec" rx="6"/>
+  <text x="110" y="322" text-anchor="middle" class="title">scripts/robocasa_eval_act.py</text>
+  <text x="110" y="340" text-anchor="middle" class="sub">复用 GR00T 客户端协议</text>
+
+  <path class="arrow" d="M205,325 L470,325 L470,290"/>
+  <rect x="475" y="295" width="220" height="55" class="box" rx="6"/>
+  <text x="585" y="318" text-anchor="middle" class="title">ZMQ inference server</text>
+  <text x="585" y="338" text-anchor="middle" class="sub">env: lerobot · port 5555 · pickle</text>
+</svg>
+
+<h2>3. 数据规格 (Data Schema)</h2>
+
+<h3>3.1 RoboCasa 原始演示 (HDF5)</h3>
+
+<table>
+  <thead>
+    <tr><th>字段</th><th>形状</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>obs/robot0_agentview_left_image</code></td><td><code>(T, H, W, 3) uint8</code></td><td>左 agentview RGB · 256×256 · 20 Hz</td></tr>
+    <tr><td><code>obs/robot0_agentview_right_image</code></td><td><code>(T, H, W, 3) uint8</code></td><td>右 agentview RGB</td></tr>
+    <tr><td><code>obs/robot0_eye_in_hand_image</code></td><td><code>(T, H, W, 3) uint8</code></td><td>腕部相机 RGB（夹爪同步）</td></tr>
+    <tr><td><code>obs/robot0_eef_pos</code></td><td><code>(T, 3)</code></td><td>末端位姿（世界系）</td></tr>
+    <tr><td><code>obs/robot0_eef_quat</code></td><td><code>(T, 4)</code></td><td>末端四元数</td></tr>
+    <tr><td><code>obs/robot0_gripper_qpos</code></td><td><code>(T, 2)</code></td><td>夹爪两指 qpos</td></tr>
+    <tr><td><code>obs/robot0_base_pos</code></td><td><code>(T, 3)</code></td><td>底盘位姿（OmronPanda 全向）</td></tr>
+    <tr><td><code>actions</code></td><td><code>(T, 12)</code></td><td>delta arm 6 + gripper 1 + base 3 + mode 2</td></tr>
+  </tbody>
+</table>
+
+<div class="note">动作 12 维拆解和 GR00T 一致（<code>action.eef_position 3 + action.eef_rotation 3 + action.gripper 1 + action.base_motion 3 + action.control_mode 2</code>）。<span class="en">Action layout matches GR00T's modality config, so eval client needs no change.</span></div>
+
+<h3>3.2 LeRobot 数据集格式</h3>
+
+<pre><code>features = {
+    "observation.images.agentview_left":  Image(shape=(256,256,3)),
+    "observation.images.agentview_right": Image(shape=(256,256,3)),
+    "observation.images.eye_in_hand":     Image(shape=(256,256,3)),
+    "observation.state":                  Sequence(Value("float32"), length=16),
+    "action":                             Sequence(Value("float32"), length=12),
+}
+fps = 20
+</code></pre>
+
+<p><code>observation.state</code> 16 维 = <code>eef_pos 3 + eef_quat 4 + gripper_qpos 2 + base_pos 3 + base_quat 4</code>（与 GR00T <code>panda_omron</code> 数据配置对齐）。</p>
+
+<h2>4. 训练超参 (Hyperparameters)</h2>
+
+<table>
+  <thead>
+    <tr><th>项</th><th>值</th><th>原因 / 来源</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>chunk size</td><td>100</td><td>ACT 原论文 ALOHA 默认；20 Hz × 5 s ≈ 一次开柜子动作</td></tr>
+    <tr><td>batch size</td><td>8</td><td>H800 80 G 可塞下 chunk=100 + 3 cam 256² fp32 backbone</td></tr>
+    <tr><td>learning rate</td><td>1e-5（transformer）<br>1e-4（视觉 encoder）</td><td>LeRobot ACT 默认；视觉 encoder 不冻结但 lr 高 10×</td></tr>
+    <tr><td>optimizer</td><td>AdamW(β=0.9,0.95, wd=1e-4)</td><td>ACT 原作 + LeRobot</td></tr>
+    <tr><td>KL weight</td><td>10</td><td>CVAE prior 正则；过低 → mode collapse</td></tr>
+    <tr><td>vision backbone</td><td>ResNet18 (ImageNet pretrain)</td><td>原作；80 M 总参数主要在 transformer，不在 backbone</td></tr>
+    <tr><td>training steps</td><td>100k (~600 epoch × 200 demos)</td><td>OpenCabinet 单任务收敛阈值</td></tr>
+    <tr><td>num demos</td><td>200-500</td><td>RoboCasa 官方 atomic 任务推荐量级</td></tr>
+    <tr><td>temporal ensembling</td><td>开（推理时）</td><td>多个 overlap chunk 加权平均，抑制不连续</td></tr>
+  </tbody>
+</table>
+
+<h2>5. GPU 预算 (AutoDL CNY)</h2>
+
+<p>本节按 AutoDL 报价计算。<span class="en">Numbers below are AutoDL CNY pricing; Aliyun / Volcano are typically 3-5× more expensive.</span></p>
+
+<table>
+  <thead>
+    <tr><th>GPU</th><th>单价</th><th>OpenCabinet 单任务</th><th>18 atomic 任务（独立训练）</th><th>18 atomic 多任务联合</th></tr>
+  </thead>
+  <tbody>
+    <tr class="recommend">
+      <td>H800 80G</td>
+      <td>¥9 / h</td>
+      <td>~12 h · <strong>¥108</strong></td>
+      <td>~216 h · <strong>¥1,944</strong></td>
+      <td>~36 h · <strong>¥324</strong></td>
+    </tr>
+    <tr>
+      <td>H20 96G</td>
+      <td>¥8 / h</td>
+      <td>~22 h · ¥176</td>
+      <td>~396 h · ¥3,168</td>
+      <td>~66 h · ¥528</td>
+    </tr>
+    <tr>
+      <td>A100 80G</td>
+      <td>¥7.5 / h</td>
+      <td>~14 h · ¥105</td>
+      <td>~252 h · ¥1,890</td>
+      <td>~42 h · ¥315</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note">"18 atomic 联合"是把 18 个任务的数据合并 + 加 task_id one-hot 进 state，按 3× chunk-saturation 估的。<strong>Linus 建议</strong>：先单任务跑通 OpenCabinet 验证 pipeline，<strong>不要</strong>一开始就上联合训练。<span class="en">Validate single-task path first; multi-task is a follow-up, not a launch goal.</span></div>
+
+<h2>6. 工程结构 (Code Layout)</h2>
+
+<pre><code>robocasa-training/
+├── README.md
+├── doc/
+│   └── training_act.html              ← 本文档
+├── configs/
+│   └── act_opencabinet.yaml           ← LeRobot 训练配置
+├── scripts/
+│   ├── collect_demos.py               ← 调 robocasa demo generator
+│   ├── convert_hdf5_to_lerobot.py     ← HDF5 → LeRobotDataset
+│   ├── train_act.py                   ← lerobot train act 薄包装
+│   └── serve_act.py                   ← ZMQ inference server (lerobot env)
+└── checkpoints/
+    └── act_opencabinet/
+        ├── model.safetensors
+        ├── config.json
+        └── stats.json                 ← state/action normalize 统计
+</code></pre>
+
+<h2>7. 落地步骤 (Step-by-Step)</h2>
+
+<h4>步骤 1 ── 采演示（在 <code>robocasa</code> conda env）</h4>
+<pre><code>python scripts/collect_demos.py \
+    --task OpenCabinet \
+    --n-demos 300 \
+    --output ~/.cache/robocasa/demos/opencab_v1.hdf5
+# 单机录 300 条，约 30 min（CPU + 离屏 mujoco render）。</code></pre>
+
+<h4>步骤 2 ── 转 LeRobot</h4>
+<pre><code>python scripts/convert_hdf5_to_lerobot.py \
+    --hdf5 ~/.cache/robocasa/demos/opencab_v1.hdf5 \
+    --repo-id local/robocasa_opencab_act \
+    --fps 20</code></pre>
+
+<h4>步骤 3 ── 训 ACT（在 <code>lerobot</code> conda env）</h4>
+<pre><code>python scripts/train_act.py \
+    --dataset local/robocasa_opencab_act \
+    --output-dir checkpoints/act_opencabinet \
+    --steps 100000 \
+    --batch 8 \
+    --chunk 100</code></pre>
+
+<h4>步骤 4 ── 评估（接现有 RoboCasa 评估流水线）</h4>
+<pre><code># 父仓 mujoco-experience/scripts/robocasa_eval_act.py 是一个薄包装：
+#   - server: bash -c "conda activate lerobot && python robocasa-training/scripts/serve_act.py ..."
+#   - client: 复用 scripts/_gr00t_eval_client.py（同 ZMQ 协议）
+python scripts/robocasa_eval_act.py \
+    --env-name OpenCabinet \
+    --n-episodes 50 \
+    --ckpt robocasa-training/checkpoints/act_opencabinet \
+    --render</code></pre>
+
+<div class="ok"><strong>Linus 提醒</strong>：评估端不要写新协议。ACT 推理就是 <code>obs → action chunk (T,12)</code>，和 GR00T 的输出形状一致 — 客户端代码完全复用，<strong>这是品味，不是巧合</strong>。<span class="en">Same wire shape → reuse the client. Not a coincidence, that's the point.</span></div>
+
+<h2>8. 成功标准 (Success Criteria)</h2>
+
+<table>
+  <thead>
+    <tr><th>阶段</th><th>指标</th><th>阈值</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>训练收敛</td><td>action L1 loss (val split)</td><td>&lt; 0.02</td></tr>
+    <tr><td>训练收敛</td><td>KL loss</td><td>稳定在 1-3 之间，不塌缩到 0</td></tr>
+    <tr><td>评估 SR</td><td>OpenCabinet success rate (50 ep)</td><td>≥ 60%（对标 GR00T N1.5 atomic-seen 68.5%）</td></tr>
+    <tr><td>评估稳定性</td><td>SR std across 3 seeds</td><td>≤ 10 个百分点</td></tr>
+  </tbody>
+</table>
+
+<h2>9. 后续任务扩展 (Roadmap)</h2>
+
+<ol>
+  <li><strong>v0.1</strong>（当前）：OpenCabinet 单任务 ACT，跑通 4 阶段流水线</li>
+  <li><strong>v0.2</strong>：扩到 4 个相关 atomic 任务（OpenCabinet / CloseCabinet / OpenDrawer / CloseDrawer），仍单任务训练 4 个 ckpt</li>
+  <li><strong>v0.3</strong>：18 atomic 联合训练（task_id one-hot 进 state），对比 GR00T N1.5 baseline</li>
+  <li><strong>v0.4</strong>：加 Diffusion Policy 对照组，同样数据 + 同样 eval pipeline，<strong>诚实对比</strong></li>
+  <li><strong>v0.5</strong>：把 SmolVLA / pi0.5 后训练接进来（不同 conda env，相同 ZMQ 协议）</li>
+</ol>
+
+<h2>10. 三问自检 (Linus Three Questions)</h2>
+
+<ul>
+  <li><strong>真问题还是假想？</strong> ✅ 真：RoboCasa GR00T 评估流水线已通，需要本地可训的策略对比组，ACT 是最小可行选项。</li>
+  <li><strong>有更简单方案吗？</strong> ❌ 没有 — 比 ACT 更简单的（BC-RNN）在 RoboCasa 上 SR 低于 30%，对比意义弱；更复杂的（diffusion / VLA）训练成本高 5-10×。</li>
+  <li><strong>会破坏什么吗？</strong> ❌ 不会 — 评估端协议 100% 复用 GR00T 客户端；父仓 <code>mujoco-experience</code> 仅新增一个薄 orchestrator 脚本，不动现有评估代码。</li>
+</ul>
+
+<div class="ok"><strong>结论</strong>：值得做。先把 OpenCabinet 单任务跑通，剩下的全是数据规模和任务数量的横向扩展，没有结构性新工作。<span class="en">Worth doing. Single-task OpenCabinet first; everything else is horizontal scaling.</span></div>
+
+</body>
+</html>
