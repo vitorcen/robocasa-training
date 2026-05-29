@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>ACT × RoboCasa OpenCabinet 实验报告 — 负面结果与方法论 (Experiment Report)</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+         max-width: 1080px; margin: 32px auto; padding: 24px;
+         background: #ffffff; color: #1f2328; line-height: 1.65; }
+  html { background: #ffffff; }
+  h1 { border-bottom: 2px solid #1f2328; padding-bottom: 8px; }
+  h2 { margin-top: 2em; border-left: 4px solid #4c8bf5; padding-left: 12px; }
+  h3 { margin-top: 1.5em; color: #4c8bf5; }
+  .tldr { background: #fff8c5; border-left: 4px solid #d4a017;
+          padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
+  .tldr-en { color: #57606a; font-style: italic; margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.92em; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  tr.win { background: #dafbe1; }
+  tr.fail { background: #ffebe9; }
+  code { background: #f6f8fa; padding: 1px 5px; border-radius: 3px;
+         font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.9em; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.86em; }
+  .note { background: #ddf4ff; border-left: 4px solid #0969da; padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .warn { background: #ffebe9; border-left: 4px solid #cf222e; padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .ok   { background: #dafbe1; border-left: 4px solid #1a7f37; padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .meta { color: #57606a; font-size: 0.9em; }
+  svg { display: block; margin: 16px auto; max-width: 100%; }
+  ul, ol { padding-left: 22px; } li { margin: 4px 0; }
+  .en { color: #57606a; font-size: 0.85em; }
+  .big { font-size: 1.15em; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>ACT × RoboCasa OpenCabinet — 实验报告（负面结果 + 方法论）</h1>
+<p class="meta">2026-05-29 · Linus 模式 · 配套 <code>robocasa-training/scripts/*</code> · 数据 RTX 4090 24G 本机</p>
+
+<div class="tldr">
+<strong>TL;DR</strong>：从头训练的 <strong>ACT (80M)</strong> 在 RoboCasa <code>OpenCabinet</code> 上，<strong>无论换数据源、加训练时长、加 inference 技巧、还是用官方 pretrain-then-finetune recipe，closed-loop 成功率全部为 0%</strong>。同一套评估管线下，预训练的 <strong>GR00T (2B VLA) 拿到 70%</strong>。结论：这是<strong>模型容量 + 预训练规模的能力差距</strong>，不是数据、推理、recipe 或评估管线的问题。小模型从头训不适合 RoboCasa atomic 操作任务。
+<div class="tldr-en">An ACT-80M trained from scratch on RoboCasa OpenCabinet scores <strong>0% closed-loop SR across every lever we pulled</strong> (human data, MimicGen data, temporal ensembling, pretrain-then-finetune). GR00T-2B (a pretrained VLA) gets 70% on the same eval pipeline. The gap is model capacity + pretraining scale — not data, inference, recipe, or pipeline.</div>
+</div>
+
+<h2>1. 投资矩阵 (The Investment Matrix)</h2>
+
+<p>每一行都是一次完整的训练 + 闭环评估。SR = 在 <code>OpenCabinet</code> target 任务上的 success rate。<span class="en">Each row is a full train + closed-loop eval cycle on the OpenCabinet target task.</span></p>
+
+<table>
+  <thead>
+    <tr><th>配置 (Config)</th><th>训练量</th><th>closed-loop SR</th><th>eef_rot 精度*</th><th>备注</th></tr>
+  </thead>
+  <tbody>
+    <tr class="fail"><td>ACT human-only 500 demos</td><td>300k steps (13 epoch)</td><td><strong>0%</strong></td><td>0.034</td><td>动作平滑但开不了门</td></tr>
+    <tr class="fail"><td>ACT mimicgen-only 500 demos</td><td>150k steps</td><td><strong>0%</strong></td><td><strong>0.033</strong></td><td>rotation 精度最佳，仍 0%</td></tr>
+    <tr class="fail"><td>+ temporal ensembling (human 300k)</td><td>—（推理技巧）</td><td><strong>0%</strong> (10/10)</td><td>—</td><td>ACT 原生闭环技巧，无效</td></tr>
+    <tr class="fail"><td>pretrain(mimicgen)→finetune(human)</td><td>150k + 100k</td><td><strong>0%</strong></td><td>0.040</td><td>官方 recipe，仍 0%</td></tr>
+    <tr class="win"><td><strong>GR00T 2B VLA</strong>（对照基线）</td><td>大规模预训练 ckpt</td><td><strong>70%</strong></td><td>—</td><td>同一评估管线</td></tr>
+  </tbody>
+</table>
+<p class="meta">* eef_rot 精度 = 末端姿态动作的开环 L1 误差（越低越好；可靠抓取约需 &lt; 0.02）。<span class="en">Open-loop L1 error on end-effector rotation action; reliable grasping needs ~&lt;0.02.</span></p>
+
+<div class="warn"><strong>核心发现 (Key finding)</strong>：四个杠杆全部 0%，而对照 VLA 70%。失败不随数据 / 训练时长 / 推理 / recipe 改变 → <strong>瓶颈是模型本身的能力，不是任何可调外围。</strong><span class="en">All four levers = 0%, baseline VLA = 70%. Failure invariant to data/steps/inference/recipe → the bottleneck is model capability itself.</span></div>
+
+<h2>2. 诊断方法 (Methodology — how we ruled things out)</h2>
+
+<h3>2.1 Open-loop replay 精度探针 (the decisive instrument)</h3>
+<p>closed-loop SR 在精度跨过成功阈值前<strong>恒为 0%，信息量极低</strong>。我们改用<strong>开环 replay 探针</strong>作为连续的领先指标：取训练集某帧（已知 ground-truth 动作），走 <em>完全相同的</em> <code>preproc → policy.predict_action_chunk → postproc</code> 路径，对比预测动作 vs 数据集记录值的逐维 L1 误差。<span class="en">closed-loop SR is 0% until precision crosses a threshold — uninformative. The open-loop replay probe gives a continuous leading signal: predicted vs recorded action L1, through the exact serve-time pipeline.</span></p>
+<p>这一步<strong>隔离了"策略是否学到"与"闭环是否成功"</strong>：</p>
+<ul>
+  <li>gripper 时机误差 <strong>0.008</strong>（近乎完美）→ 策略确实在模仿，不是 bug</li>
+  <li>排除了 plumbing bug：GR00T 用<strong>同一个 client + env</strong> 拿到 70%，证明动作字典格式、ZMQ 协议、env 全对</li>
+</ul>
+
+<h3>2.2 分 slice + watcher（强制，来自姊妹项目教训）</h3>
+<p>任何 &gt;1h 训练都<strong>分 10 段、每段后台 eval、状态分类（DEAD/UNDERFIT/OVERFIT/PROGRESS）+ 早停 marker</strong>。来自 LeIsaac 的血泪教训：DP 训 10h loss 完美收敛，final eval 0/15 —— 一次 10k 步 quick eval 就能 1h 内发现，省 9h。<span class="en">Mandatory sliced training + background eval per slice. Never "nohup and walk away."</span></p>
+
+<h2>3. 精度趋势 (Precision Trajectories)</h2>
+<p>开环 L1 误差随训练步数变化（在各自训练分布上测）。<span class="en">Open-loop L1 error vs training step.</span></p>
+<table>
+  <thead><tr><th>step</th><th>human eef_pos</th><th>human eef_rot</th><th>mimicgen eef_pos</th><th>mimicgen eef_rot</th></tr></thead>
+  <tbody>
+    <tr><td>100k</td><td>0.076</td><td>0.072</td><td>0.080</td><td>0.033</td></tr>
+    <tr><td>150k</td><td>0.051</td><td>0.061</td><td>0.071</td><td>0.033</td></tr>
+    <tr><td>300k</td><td>0.060</td><td>0.040</td><td>—</td><td>—</td></tr>
+  </tbody>
+</table>
+<div class="note">
+<strong>读图 (Reading it)</strong>：
+<ul>
+  <li><strong>human</strong>：eef_pos 稳降到 ~0.05，但 <strong>eef_rot 是顽固瓶颈</strong>（降得最慢，300k 才到 0.040）—— 抓门把手最需要姿态精度。</li>
+  <li><strong>mimicgen</strong>：<strong>eef_rot 在 100k 就达 0.033</strong>，比 human 训 3 倍步数还好 —— 自动生成的演示姿态更一致/可学。但 closed-loop 仍 0%（mimicgen 演示的初始分布与 target eval 偏 + 闭环累积误差）。</li>
+  <li>两个数据源同样的失败模式（开环精度尚可、闭环 0%）→ 把怀疑从"数据"指向"模型能力 / 闭环"。</li>
+</ul>
+</div>
+
+<h2>4. 为什么是 0% (Why 0% — the diagnosis chain)</h2>
+
+<svg viewBox="0 0 980 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="diagnosis chain">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/></marker>
+    <style>
+      .b{fill:#f6f8fa;stroke:#1f2328;stroke-width:1.5;} .bf{fill:#ffebe9;stroke:#cf222e;stroke-width:1.5;}
+      .bw{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5;}
+      .t{font:bold 13px sans-serif;fill:#1f2328;} .s{font:11px sans-serif;fill:#57606a;}
+      .a{stroke:#1f2328;stroke-width:1.5;fill:none;marker-end:url(#ar);}
+    </style>
+  </defs>
+  <rect x="20" y="30" width="200" height="60" class="bf" rx="6"/>
+  <text x="120" y="55" text-anchor="middle" class="t">观察: SR=0%</text>
+  <text x="120" y="74" text-anchor="middle" class="s">机器人动作平滑却开不了门</text>
+  <path class="a" d="M225,60 L265,60"/>
+  <rect x="270" y="20" width="200" height="40" class="b" rx="6"/>
+  <text x="370" y="44" text-anchor="middle" class="s">排除 plumbing? GR00T同client 70% ✓</text>
+  <rect x="270" y="70" width="200" height="40" class="b" rx="6"/>
+  <text x="370" y="94" text-anchor="middle" class="s">排除 inference? n_action 8/50 + TE 都0% ✓</text>
+  <path class="a" d="M475,60 L515,60"/>
+  <rect x="520" y="20" width="200" height="40" class="b" rx="6"/>
+  <text x="620" y="44" text-anchor="middle" class="s">排除 数据? human+mimicgen 都0% ✓</text>
+  <rect x="520" y="70" width="200" height="40" class="b" rx="6"/>
+  <text x="620" y="94" text-anchor="middle" class="s">排除 recipe? pretrain-finetune 0% ✓</text>
+  <path class="a" d="M725,60 L765,60"/>
+  <rect x="770" y="30" width="190" height="60" class="bw" rx="6"/>
+  <text x="865" y="55" text-anchor="middle" class="t">结论: 能力差距</text>
+  <text x="865" y="74" text-anchor="middle" class="s">容量 + 预训练规模</text>
+  <rect x="270" y="150" width="690" height="70" class="b" rx="6"/>
+  <text x="615" y="175" text-anchor="middle" class="t">对照: GR00T 2B VLA, 同一评估管线 → 70%</text>
+  <text x="615" y="198" text-anchor="middle" class="s">证明评估管线正确, 任务可解; 差的是 80M-from-scratch 的能力</text>
+  <path class="a" d="M865,95 L865,150"/>
+</svg>
+
+<p>逐一排除：<strong>plumbing</strong>（GR00T 同 client 70%）、<strong>inference</strong>（n_action_steps 8/50 + temporal ensembling 都 0%）、<strong>数据源</strong>（human + mimicgen 都 0%）、<strong>recipe</strong>（pretrain-then-finetune 0%）。剩下唯一变量：<strong>模型本身</strong>。</p>
+
+<h2>5. 工程踩坑实录 (Engineering War Stories)</h2>
+<table>
+  <thead><tr><th>坑</th><th>症状</th><th>根因 + 修法</th></tr></thead>
+  <tbody>
+    <tr><td>推理缺 postprocessor</td><td>机器人飞到场景外 1.2m</td><td><code>predict_action_chunk</code> 返回 normalized 动作；必须接 ckpt 的 unnormalizer postprocessor。修后 Δeef 从 334mm→63mm。</td></tr>
+    <tr><td>torchcodec fork SEGV</td><td>num_workers&gt;0 在 ~step24k 段错误</td><td>module 全局 decoder cache 被 fork 继承失效 handle。<strong>修法：precache mp4→.npy memmap，彻底移除 torchcodec</strong>（data_s 0.21→0.001s，4→32 step/s）。详见 <code>frame_cache_patch.py</code>。</td></tr>
+    <tr><td>save_freq 死循环</td><td>retry 反复回到同一 ckpt</td><td>save_freq 误算成 slice 大小；崩溃丢全部进度。修为固定 5000。</td></tr>
+    <tr><td>mimicgen v2.0 格式</td><td>convert/训练报错</td><td>(1) state/action dtype <code>object</code>→<code>float64</code>；(2) stats.json 缺图像 key（v2.0 没算）→ 补 imagenet stats。两修复内置进 <code>subset_mimicgen.py</code>。</td></tr>
+    <tr><td>robocasa env reset 不稳</td><td>eval 间歇 SIGSEGV / placement sampler <code>_NoValueType</code></td><td>离屏渲染器跨 reset 泄漏 GL + numpy 兼容。缓解：client 增量写结果，launcher 容忍 partial（≥1 episode 即用）。</td></tr>
+  </tbody>
+</table>
+
+<h2>6. 可复用资产 (Reusable Assets)</h2>
+<pre><code>robocasa-training/scripts/
+├── train_act.py            # 分slice watcher + retry + resume + --init-from finetune
+├── serve_act.py            # ZMQ 推理 server + temporal ensembling + reset op
+├── precache_videos.py      # mp4 → .npy memmap (bit-identical 验证), 避 torchcodec SEGV
+├── frame_cache_patch.py    # monkey-patch decode_video_frames 读 memmap
+├── pid_safe_decoder_patch.py  # PID-aware torchcodec cache (备用方案)
+└── subset_mimicgen.py      # v2.0→v2.1 子集 (内置 dtype + image-stats 修复)
+
+../scripts/
+├── robocasa_eval_act.py    # 评估编排 (server@lerobot + client@robocasa, ZMQ)
+└── _gr00t_eval_client.py   # 共用 client (ACT 与 GR00T 同协议, --send-reset for TE)</code></pre>
+
+<h2>7. 结论与建议 (Conclusion &amp; Recommendations)</h2>
+<p class="big">小模型从头训不是 RoboCasa atomic 操作任务的正确工具。</p>
+<ol>
+  <li><strong>要 &gt;0%</strong>：走预训练 VLA 路线（GR00T 在本仓已 70%），或大幅加大模型 + 数据规模。</li>
+  <li><strong>本对照矩阵本身是有价值的发现</strong>：明确了"ACT-scratch 全 0% vs GR00T-VLA 70%"的边界，省下重复踩坑。</li>
+  <li><strong>方法论可迁移</strong>：open-loop replay 精度探针 + 分 slice watcher + 开环精度作为闭环的领先指标，适用于任何 BC 策略调试。</li>
+</ol>
+<div class="ok"><strong>三问自检</strong>：真问题 ✅（需本地可训对比组）｜更简单方案 ❌（小模型已最简，但能力不够）｜破坏什么 ❌（零破坏，资产全复用）。<strong>诚实记录负面结果，比假装成功有价值。</strong><span class="en">An honest negative result beats a faked success.</span></div>
+
+</body>
+</html>

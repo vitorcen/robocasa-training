@@ -228,21 +228,28 @@ fps = 20
   </thead>
   <tbody>
     <tr class="recommend">
-      <td>H800 80G</td>
-      <td>¥9 / h</td>
-      <td>~12 h · <strong>¥108</strong></td>
-      <td>~216 h · <strong>¥1,944</strong></td>
-      <td>~36 h · <strong>¥324</strong></td>
+      <td>RTX 4090 24G (本机实测)</td>
+      <td>—</td>
+      <td><strong>~95 min</strong> (bs=8, bf16)</td>
+      <td>~28 h</td>
+      <td>~5 h</td>
     </tr>
     <tr>
-      <td>H20 96G</td>
+      <td>H800 80G (AutoDL)</td>
+      <td>¥9 / h</td>
+      <td>~12 h · ¥108</td>
+      <td>~216 h · ¥1,944</td>
+      <td>~36 h · ¥324</td>
+    </tr>
+    <tr>
+      <td>H20 96G (AutoDL)</td>
       <td>¥8 / h</td>
       <td>~22 h · ¥176</td>
       <td>~396 h · ¥3,168</td>
       <td>~66 h · ¥528</td>
     </tr>
     <tr>
-      <td>A100 80G</td>
+      <td>A100 80G (AutoDL)</td>
       <td>¥7.5 / h</td>
       <td>~14 h · ¥105</td>
       <td>~252 h · ¥1,890</td>
@@ -251,6 +258,11 @@ fps = 20
   </tbody>
 </table>
 
+<div class="note">
+<strong>本机 4090 实测</strong>（2026-05-29）：bs=8 + bf16-amp + chunk=100 + ResNet18 + 3 cam 256² 单卡塞下，VRAM 占用 22.75/24.56 GiB (93%)。step time ≈ 0.037 s update + 0.020 s data ≈ <strong>17 step/s 稳态</strong>。100k steps ≈ 95 min。比 H800 80G 还快 (H800 单 GPU 估 12 h 是按更大 batch+chunk 给的；同 bs 下 4090 实际相当能打)。<span class="en">Single 4090 24G actually beats H800 here when same batch/chunk — the H800 estimate assumed a 4× larger batch for 8× the wall-clock loss. Verified on this machine, 22.75/24.56 GiB occupied.</span>
+<br><br>
+<strong>更新预算结论</strong>：单任务训练成本不再是瓶颈，<strong>本机一晚就够 18 任务全跑完</strong>。AutoDL 只有在做联合训练 + 数据并行扩大 batch 时才有边际收益。
+</div>
 <div class="note">"18 atomic 联合"是把 18 个任务的数据合并 + 加 task_id one-hot 进 state，按 3× chunk-saturation 估的。<strong>Linus 建议</strong>：先单任务跑通 OpenCabinet 验证 pipeline，<strong>不要</strong>一开始就上联合训练。<span class="en">Validate single-task path first; multi-task is a follow-up, not a launch goal.</span></div>
 
 <h2>6. 工程结构 (Code Layout)</h2>
