@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GR00T-N1.7 MimicGen 数据增强方案 / MimicGen Data Strategy</title>
+<style>
+  html, body { background: #ffffff; color: #1a1a1a; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         line-height: 1.65; max-width: 1080px; margin: 0 auto; padding: 32px 28px; }
+  h1 { font-size: 1.7em; border-bottom: 3px solid #2c6cb0; padding-bottom: 8px; }
+  h2 { font-size: 1.32em; color: #2c6cb0; margin-top: 1.8em;
+       border-left: 5px solid #2c6cb0; padding-left: 10px; }
+  h3 { font-size: 1.1em; color: #444; margin-top: 1.4em; }
+  .en { color: #6a737d; font-style: italic; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 0.94em; }
+  th, td { border: 1px solid #d0d7de; padding: 7px 11px; text-align: left; }
+  th { background: #f0f5fa; }
+  tr:nth-child(even) td { background: #fafbfc; }
+  code { background: #f3f4f6; padding: 1px 6px; border-radius: 4px;
+         font-family: "SF Mono", Consolas, monospace; font-size: 0.88em; color: #b5174a; }
+  .box { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px;
+         padding: 14px 18px; margin: 16px 0; }
+  .tldr { background: #eef6ff; border-left: 5px solid #2c6cb0; }
+  .warn { background: #fff8e6; border-left: 5px solid #e0a800; }
+  .ok   { background: #eaf7ee; border-left: 5px solid #28a745; }
+  .rec  { background: #f0ebff; border-left: 5px solid #6f42c1; }
+  .big  { font-size: 1.15em; font-weight: 600; }
+  svg { display: block; margin: 18px auto; background: #fff; }
+  ul { margin: 8px 0; }
+  .tag { display: inline-block; background: #2c6cb0; color: #fff; border-radius: 4px;
+         padding: 1px 8px; font-size: 0.8em; margin-right: 6px; }
+</style>
+</head>
+<body>
+
+<h1>GR00T-N1.7 MimicGen 数据增强方案<br>
+<span class="en" style="font-size:0.6em">MimicGen Data Augmentation Strategy for OpenCabinet</span></h1>
+<p style="color:#888">2026-05-30 · RoboCasa OpenCabinet 单任务 · 方案记录 + 训练时间估算（待命，未执行）</p>
+
+<div class="box tldr">
+<p class="big">TL;DR</p>
+<p><b>问题 Problem</b>：N1.7 本机自训（500 human demo）公平 30 轮榜单只到 <b>36% SR</b>，输给下载的 N1.5（64%）。瓶颈是 demo 多样性——难款柜子开不了。<br>
+<span class="en">N1.7 (500 human demos) scores 36% SR, losing to N1.5's 64%. Bottleneck is demo diversity — it fails on harder cabinet styles.</span></p>
+<p><b>方案 Plan</b>：本地已有官方 <b>MimicGen 8644 ep</b>（17× 当前数据，格式完整可直接混训）。<b>子采样 + 难款加权</b>——不用全量，对失败多的款式多采，控制在 <b>2–3× 当前训练时间（6–9h）</b>。<br>
+<span class="en">Use the local official MimicGen 8644-ep set via sub-sampling + hard-style weighting; keep wall-time at 2–3× (6–9h).</span></p>
+<p><b>触发 Trigger</b>：当前 16k 续训用公平 benchmark 评完——若 SR 仍停在 ~36% 上不去（数据瓶颈坐实），再上本方案。<br>
+<span class="en">Execute only if the in-progress 16k run's SR stalls near 36%.</span></p>
+</div>
+
+<h2>1. 数据盘点 <span class="en">Data Inventory</span></h2>
+<table>
+<tr><th>数据集 Dataset</th><th>episodes</th><th>frames</th><th>modality.json</th><th>用途 Use</th></tr>
+<tr><td>target/…/lerobot_old <span class="tag">当前训练</span></td><td>500</td><td>184k</td><td>✅</td><td>N1.7 现在训的 human demo（target split）</td></tr>
+<tr><td><b>pretrain/…/mg</b> <span class="tag">MimicGen</span></td><td><b>8 644</b></td><td><b>3.74M</b></td><td>✅</td><td>🌟 官方大规模 MimicGen（增强源）</td></tr>
+<tr><td>mimicgen_opencab_500</td><td>500</td><td>217k</td><td>✅</td><td>小 MG 集（备用）</td></tr>
+</table>
+
+<div class="box ok">
+<b>关键确认 Key facts</b>（均已 only-read 核实）
+<ul>
+<li>MG 的 <code>features</code> 键与当前训练集<b>完全一致</b>（3 相机 + state + action + 语言标注）→ 可直接混训，<b>无需格式转换</b>。<br><span class="en">MG feature keys match the training set exactly → drop-in mixable, no conversion.</span></li>
+<li>MG demo 时长：median 427 / max 636 步（@20fps），与 human demo 同量级。8644 ep 全 unique trajectory_id。</li>
+</ul>
+</div>
+
+<div class="box warn">
+<b>⚠️ 诚实校正 Honest caveat（"按款式分层"的真实可行性）</b><br>
+经逐字段核实，<b>MG 数据里没有任何现成的 layout/style 标签</b>：<code>metadata.json</code> 只有 statistics/modalities；<code>episodes.jsonl</code> 只有 trajectory_id/length/tasks；<code>initial_actions.npz</code> 每 ep 只有<b>初始动作</b>（base_motion/eef_pos/eef_rot/gripper），<b>不含初始位置</b>，无法聚类反推款式。<br>
+<span class="en">Verified field-by-field: MG carries NO layout/style label anywhere. initial_actions.npz holds the first ACTION, not pose — cannot infer style by clustering.</span><br>
+→ <b>含义</b>：直接"按 10 款精确配额"做不到。要拿款式只有<b>重放每条 demo 初始状态进 robocasa 读 <code>layout_id</code></b>（准但慢，8644 ep 需数小时）。因此推荐<b>不依赖款式标签</b>的 §4 方案。
+</div>
+
+<h2>2. 为什么子采样而非全量 <span class="en">Why sub-sample, not all 8644</span></h2>
+<svg width="980" height="250" viewBox="0 0 980 250" font-family="sans-serif" font-size="13">
+  <text x="20" y="26" font-weight="bold" font-size="15">数据量 ↔ 训练时间 ↔ 收益  Data ↔ Time ↔ Gain</text>
+  <text x="20" y="66">当前 Current</text>
+  <rect x="180" y="52" width="36" height="22" fill="#2c6cb0"/>
+  <text x="226" y="68">500 ep human · 16k step · ~3h · SR 36%</text>
+  <text x="20" y="112">全量 Full MG</text>
+  <rect x="180" y="98" width="680" height="22" fill="#d0454c"/>
+  <text x="866" y="114" font-size="11">8644+500 · ~270k step 才同覆盖 · ~50h ❌</text>
+  <text x="20" y="158">子采样 Sub-sample</text>
+  <rect x="180" y="144" width="150" height="22" fill="#28a745"/>
+  <text x="340" y="160">~1500 MG + 500 human · 40k step · ~7h ✅ 2.5×</text>
+  <line x1="180" y1="186" x2="860" y2="186" stroke="#ccc"/>
+  <text x="20" y="210" fill="#666">GR00T 用 sharded streaming，step 与数据量解耦；但要让新数据被"看够"，step 须随数据量同比增长。</text>
+  <text x="20" y="230" class="en" fill="#999">Steps must scale with data to cover it; full set explodes step count. Sub-sampling balances coverage vs time.</text>
+</svg>
+
+<h2>3. 训练时间估算 <span class="en">Wall-time Estimate</span></h2>
+<p>实测基准：micro-batch=1（4090 + 3 相机），<code>~0.67 s/step</code>（1.48 it/s，已验证）。含 watchdog 分段 eval + 偶发崩溃重试再 +15–20%。</p>
+<table>
+<tr><th>配置</th><th>step</th><th>纯训练</th><th>含 eval/重试</th><th>倍数</th></tr>
+<tr><td>当前 16k 续训（进行中，已到 ckpt-10000）</td><td>16 000</td><td>~3.0 h</td><td>~3.5 h</td><td>1×</td></tr>
+<tr><td><b>2× 时间</b></td><td>32 000</td><td>~6 h</td><td>~7 h</td><td>2×</td></tr>
+<tr><td><b>3× 时间</b></td><td>48 000</td><td>~9 h</td><td>~10 h</td><td>3×</td></tr>
+<tr><td>全量 MG 同覆盖（参考）</td><td>~270 000</td><td>~50 h</td><td>~60 h ❌</td><td>~17×</td></tr>
+</table>
+<div class="box warn">
+<b>结论</b>：你的直觉对——全量 ~50h 不现实。<b>2–3× 时间（6–9h）= 32–48k step + ~1500 ep MG 子集</b>，性价比甜点。
+<span class="en">Full = ~50h. Sweet spot: 2–3× time (6–9h) = 32–48k steps + ~1500-ep MG subset.</span>
+</div>
+
+<h2>4. 推荐方案：随机子采样（不依赖款式标签）<span class="en">Recommended: label-free random sub-sample</span></h2>
+<div class="box rec">
+既然 MG 没有款式标签，最稳妥也最省事的就是<b>从 8644 ep 均匀随机抽 ~1500 ep</b>（用 <code>episode_sampling_rate</code> 或 episode 过滤）。因为 MG 本身按 layout×style 近似均匀生成，<b>均匀随机抽样天然就覆盖各款</b>——不需要显式分层。难款会因为"全局多样性提升"被动受益。<br>
+<span class="en">Since MG has no style label, just uniformly sample ~1500 of 8644 eps. MG is generated near-uniformly across styles, so random sampling covers all styles for free — hard styles benefit from the global diversity boost.</span>
+</div>
+
+<h3>4.1 进阶：真要"偏袒难款"的两条路 <span class="en">If you insist on hard-style weighting</span></h3>
+<table>
+<tr><th>路径</th><th>做法</th><th>代价</th></tr>
+<tr><td><b>路径① 重放标注</b><br><span class="en">replay-label</span></td>
+    <td>逐条重放 MG demo 初始状态进 robocasa 读 <code>layout_id</code>，给 8644 ep 打款式标签，再按难度加权</td>
+    <td>准确，但一次性 ~数小时重放（8644 ep）</td></tr>
+<tr><td><b>路径②（推荐）课程式两轮</b><br><span class="en">curriculum</span></td>
+    <td>先随机子采样训一版 → benchmark 看哪些 seed/layout 仍失败 → 第二轮<b>只补这些难 layout 的 human/MG demo</b>（target split 的款式可控）</td>
+    <td>无需给 MG 全量打标；用评测结果驱动，自然"偏袒难款"</td></tr>
+</table>
+<div class="box ok">
+<b>结论 Bottom line</b>：先用 §4 随机子采样（最省事、覆盖全），把 N1.7 拉一波；若仍有几款顽固失败，再用<b>路径②课程式</b>定点补这些款——这比一开始就给 8644 ep 打标签实际得多。<br>
+<span class="en">Start label-free random; if specific styles stay stuck, do a curriculum second round targeting them. More practical than labelling all 8644 up front.</span>
+</div>
+
+<h3>4.2 两种混训配方 <span class="en">Two recipes</span></h3>
+<table>
+<tr><th>配方</th><th>做法</th><th>优点</th><th>缺点</th></tr>
+<tr><td class="big">A 混合单阶段</td>
+    <td>MG 子集 + human 拼一个数据集，一次训 ~40k step</td>
+    <td>最简单；复用现有 watchdog；一次出结果</td>
+    <td>MG(pretrain) 与 human(target) 分布混合，可能稀释 target 精度</td></tr>
+<tr><td class="big">B 两阶段（官方配方）</td>
+    <td>① MG 子集预训练 → ② human target 微调（少 step）</td>
+    <td>GR00T 官方推荐；广度打底 + target 精修</td>
+    <td>两段流程，多一次配置</td></tr>
+</table>
+<div class="box rec">
+<b>推荐 A 起步</b>：单阶段最简单、能复用现有 watchdog，先验证"加 MG 是否提升"。若 A 有效但 target 精度被稀释，再升级 B。<br>
+<span class="en">Start with A to validate the lift; escalate to B only if target precision gets diluted.</span>
+</div>
+
+<h2>5. 实施步骤 <span class="en">Steps</span></h2>
+<div class="box">
+<ol>
+<li><b>等 16k 训完评估</b>：公平 benchmark → SR 是否还在涨？</li>
+<li><b>生成 MG 子集</b>：从 8644 ep <b>均匀随机抽 ~1500 ep</b>，写新 lerobot 子集（episode 过滤），与 human 500 拼合。</li>
+<li><b>（可选）per-style SR</b>：eval client 记录每 ep 的 <code>layout_id</code>（reset 后读 <code>env.unwrapped.env.layout_id</code> 写进 results json）→ 算每款 SR，供"路径②课程式"第二轮定点补款。</li>
+<li><b>混训</b>：配方 A，<code>MAX_STEPS≈40000</code> 指向混合数据集，watchdog 续训。</li>
+<li><b>统一公平评</b>：最佳 ckpt 跑 30 轮 seed-locked benchmark，对比 N1.5/pi0.5。</li>
+</ol>
+</div>
+
+<h2>6. 决策树 <span class="en">Decision Tree</span></h2>
+<svg width="760" height="300" viewBox="0 0 760 300" font-family="sans-serif" font-size="13">
+  <rect x="280" y="10" width="200" height="42" rx="6" fill="#eef6ff" stroke="#2c6cb0"/>
+  <text x="298" y="36">16k 续训 benchmark 评</text>
+  <line x1="380" y1="52" x2="380" y2="80" stroke="#888"/>
+  <rect x="270" y="80" width="220" height="42" rx="6" fill="#fff8e6" stroke="#e0a800"/>
+  <text x="290" y="106">SR 比 8k(36%) 提升明显？</text>
+  <line x1="270" y1="101" x2="120" y2="150" stroke="#28a745"/>
+  <text x="150" y="135" fill="#28a745">是 Yes</text>
+  <rect x="20" y="150" width="200" height="58" rx="6" fill="#eaf7ee" stroke="#28a745"/>
+  <text x="38" y="174">步数红利还在 →</text>
+  <text x="38" y="194">先继续训，暂不上 MG</text>
+  <line x1="490" y1="101" x2="640" y2="150" stroke="#d0454c"/>
+  <text x="560" y="135" fill="#d0454c">否 No（停滞）</text>
+  <rect x="540" y="150" width="210" height="58" rx="6" fill="#f0ebff" stroke="#6f42c1"/>
+  <text x="558" y="174">数据瓶颈坐实 →</text>
+  <text x="558" y="194">执行本方案（配方 A）</text>
+  <line x1="645" y1="208" x2="645" y2="240" stroke="#888"/>
+  <rect x="500" y="240" width="250" height="50" rx="6" fill="#f6f8fa" stroke="#888"/>
+  <text x="518" y="262">~1500 ep MG 子集 + 难款加权</text>
+  <text x="518" y="280" fill="#666">40k step ≈ 2.5× 时间 ≈ 7h</text>
+</svg>
+
+<div class="box warn">
+<b>当前状态 Current status</b>（2026-05-30）：16k 续训进行中（已到 <b>ckpt-10000</b>，GPU 满载）。本方案<b>仅记录待命</b>，不打断当前 run。N1.5(64%)/pi0.5(17%) 的 30 轮基线已备份在 <code>benchmark/results/authoritative_30round/</code>。
+</div>
+
+</body>
+</html>

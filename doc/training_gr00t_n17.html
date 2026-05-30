@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>微调 GR00T-N1.7 策略：RoboCasa OpenCabinet (Finetune GR00T-N1.7 for OpenCabinet)</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+         max-width: 1040px; margin: 32px auto; padding: 24px;
+         background: #ffffff; color: #1f2328;
+         line-height: 1.65; }
+  html { background: #ffffff; }
+  h1 { border-bottom: 2px solid #1f2328; padding-bottom: 8px; }
+  h2 { margin-top: 2em; border-left: 4px solid #4c8bf5; padding-left: 12px; }
+  h3 { margin-top: 1.6em; color: #4c8bf5; }
+  h4 { margin-top: 1.2em; color: #57606a; }
+  .tldr { background: #fff8c5; border-left: 4px solid #d4a017;
+          padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
+  .tldr-en { color: #57606a; font-style: italic; margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left;
+           vertical-align: top; }
+  th { background: #f6f8fa; }
+  tr.recommend { background: #dafbe1; }
+  tr.recommend td:first-child::after { content: " ✨"; }
+  code { background: #f6f8fa; padding: 1px 5px; border-radius: 3px;
+         font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.9em; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto;
+        font-size: 0.88em; }
+  .note { background: #ddf4ff; border-left: 4px solid #0969da;
+          padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .warn { background: #ffebe9; border-left: 4px solid #cf222e;
+          padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .ok   { background: #dafbe1; border-left: 4px solid #1a7f37;
+          padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .meta { color: #57606a; font-size: 0.9em; }
+  svg  { display: block; margin: 16px auto; max-width: 100%; }
+  ul   { padding-left: 22px; }
+  li   { margin: 4px 0; }
+  .en  { color: #57606a; font-size: 0.85em; }
+  .kbd { background: #eaeef2; border: 1px solid #d0d7de; border-bottom-width: 2px;
+         border-radius: 4px; padding: 1px 6px; font-family: monospace; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<h1>微调 GR00T-N1.7 策略 ── RoboCasa OpenCabinet 开柜子任务</h1>
+<p class="meta">2026-05-29 · Linus 模式 · <code>robocasa-training</code> 仓库 · 配套 <a href="training_act.html"><code>training_act.html</code></a>（ACT baseline）与 <a href="act_opencabinet_results.html"><code>act_opencabinet_results.html</code></a>（ACT 负面结果）</p>
+
+<div class="tldr">
+<strong>TL;DR</strong>：在本机 4090 微调 <strong>GR00T-N1.7-3B</strong> 攻 RoboCasa <code>OpenCabinet</code>。<strong>不是 8bit、不是 LoRA</strong>——是 <strong>bf16 选择性全参微调</strong>：冻结 Cosmos VLM backbone（视觉 + 语言），只训 DiT action head + projector（<strong>~560 M 可训练</strong>）。4090 24G 靠 <strong>adafactor + 梯度检查点</strong> 压显存（实测 22.4 GB / 3.5 s/step）。边训边 eval 用 <strong>watchdog 单 GPU 串行</strong>：训一段 → 杀进程腾显存 → 起 eval server 跑 N 轮 → 杀掉 → resume。配方 1:1 移植自姊妹项目 LeIsaac 的 N1.7 PickOrange recipe，换数据/embodiment 即可。
+<div class="tldr-en">Finetune GR00T-N1.7-3B on a single 4090 for OpenCabinet. NOT 8bit, NOT LoRA — bf16 selective full-finetune: freeze the Cosmos VLM backbone, train only the DiT action head + projector (~560M trainable). 24G fits via adafactor + gradient checkpointing (measured 22.4 GB / 3.5 s/step). Train-while-eval is a single-GPU serial watchdog. Recipe ported verbatim from the sibling LeIsaac N1.7 PickOrange pipeline.</div>
+</div>
+
+<h2>1. 先回答："是 8bit 全参微调吗？" (What kind of finetune?)</h2>
+
+<p>查了姊妹项目 <code>LeIsaac/scripts/finetune/gr00t/</code> 的 N1.7 配方（<code>launch_finetune_ckpt_n17.py</code> + <code>train_n17.sh</code>），结论直接：</p>
+
+<table>
+  <thead>
+    <tr><th>方式</th><th>用没用</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr class="recommend">
+      <td><strong>选择性全参微调 (bf16)</strong></td>
+      <td>✅ 这就是答案</td>
+      <td>冻结 Cosmos 视觉 encoder + LLM backbone（<code>tune_visual=False</code>、<code>tune_llm=False</code>、<code>tune_top_llm_layers=0</code>），<strong>全精度训</strong> DiT action head + projector + 线性头，~560 M 可训练（占 3B 的 ~19%）</td>
+    </tr>
+    <tr>
+      <td>8bit 量化优化器 (paged_adamw_8bit)</td>
+      <td>❌ 试过，放弃</td>
+      <td>4090 N1.6 阶段试过用 bitsandbytes 8bit optimizer 省显存，<strong>bnb 0.49.2 在 step 501 resume 时崩</strong>。改用 adafactor（无 8bit 依赖、内存占用相当）</td>
+    </tr>
+    <tr>
+      <td>LoRA / QLoRA</td>
+      <td>❌ 没用</td>
+      <td>GR00T 官方配方就是冻 backbone + 全参训 action head，action head 本身不大（DiT），没必要再 LoRA。LoRA 是给"想训 LLM backbone 又没显存"的场景，这里 LLM 直接冻死</td>
+    </tr>
+    <tr>
+      <td>权重 8bit/4bit 加载 (load_in_8bit)</td>
+      <td>❌ 没用</td>
+      <td><code>load_bf16=False</code> + 全 bf16 计算。3B 模型 bf16 权重 ~6 GB，4090 装得下，不需要量化加载</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>一句话</strong>：<strong>冻 VLM、全参训 action head、bf16、adafactor + 梯度检查点压显存</strong>。8bit 只在"优化器状态"这一层试过且被 adafactor 取代，权重和计算全程 bf16。<span class="en">Freeze the VLM, full-finetune the action head in bf16, squeeze VRAM with adafactor + gradient checkpointing. 8bit was only ever tried at the optimizer-state layer and got replaced by adafactor.</span></div>
+
+<h3>1.1 显存怎么压进 4090 24G 的</h3>
+
+<table>
+  <thead>
+    <tr><th>手段</th><th>作用</th><th>代价</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>adafactor</code> 优化器</td><td>不存 Adam 的一阶/二阶动量矩阵，优化器状态从 O(2·params) 降到 ~O(0)</td><td>收敛略慢于 AdamW，单任务可接受</td></tr>
+    <tr><td>梯度检查点 <code>use_reentrant=False</code></td><td>前向不缓存全部激活，反向时重算 → 激活显存约减半</td><td>吞吐 ~−30%（这就是 3.5 s/step 的主因）</td></tr>
+    <tr><td>冻结 VLM backbone</td><td>2.4 B 参数不需要梯度/优化器状态</td><td>无（这本就是配方设计）</td></tr>
+    <tr><td><code>global_batch=8 / grad_accum=4</code></td><td>每步真实 micro-batch=2，激活峰值压到最低</td><td>需 4 步累积才更新一次</td></tr>
+    <tr><td><code>expandable_segments:True</code></td><td>CUDA 分配器减碎片，避免 OOM 抖动</td><td>无</td></tr>
+  </tbody>
+</table>
+
+<div class="ok"><strong>本机 4090 实测</strong>（来自 LeIsaac N1.7 同配方）：显存峰值 <strong>~22.4 / 24.5 GiB</strong>，<strong>~3.5 s/step</strong>（grad-ckpt 开 + adafactor + micro-batch 2 + torch.compile action_head）。PickOrange 在 <strong>~6000 step 收敛到 14/15 SOTA</strong>。<span class="en">Measured on this 4090 via the same N1.7 recipe: ~22.4 GiB peak, ~3.5 s/step, PickOrange converged at ~6000 steps.</span></div>
+
+<h2>2. 为什么训 GR00T-N1.7（而不是 ACT / N1.5）</h2>
+
+<p>本仓已经证明：<strong>ACT-80M 从头训在 OpenCabinet 上 closed-loop SR 全程 0%</strong>（human / mimicgen / temporal-ensembling / pretrain-finetune 四杠杆全试尽，见 <a href="act_opencabinet_results.html">ACT 负面结果文档</a>）。对照组 <strong>GR00T-N1.5（大规模预训练 VLA）同 eval 管线 70%</strong>。差距是模型容量 + 预训练规模。N1.7 是这条正确路线的升级。</p>
+
+<table>
+  <thead>
+    <tr><th>策略</th><th>规模 / backbone</th><th>OpenCabinet SR</th><th>本仓定位</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ACT (from scratch)</td><td>80 M / ResNet18</td><td><strong>0%</strong>（已验证）</td><td>负面 baseline，证明小模型从头训不行</td></tr>
+    <tr><td>GR00T-N1.5（官方 ckpt 直评）</td><td>2 B / Eagle VLM</td><td><strong>70%</strong>（已验证）</td><td>当前最强对照（multitask ckpt-120000）</td></tr>
+    <tr class="recommend"><td>GR00T-N1.7-3B（本文档微调）</td><td>3 B / Cosmos-Reason2-2B</td><td>目标 ≥ 70%</td><td><strong>本仓主攻：单任务专精微调能否超过 N1.5 多任务</strong></td></tr>
+  </tbody>
+</table>
+
+<div class="note"><strong>假设</strong>：N1.5 的 70% 是 18-atomic <em>多任务</em> ckpt 的泛化值。在 OpenCabinet <em>单任务</em> 500 demo 上专精微调 N1.7（更新的 Cosmos backbone + relative action + action_horizon=40），有理由期望 <strong>≥ 70%</strong>。这是值得验证的真问题。<span class="en">N1.5's 70% is a multitask generalist. Single-task finetuning N1.7 on 500 OpenCabinet demos should plausibly match or beat it — that's the hypothesis worth testing.</span></div>
+
+<h2>3. 整体流水线 (Pipeline Overview)</h2>
+
+<svg viewBox="0 0 980 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GR00T-N1.7 finetune pipeline">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <style>
+      .box { fill:#f6f8fa; stroke:#1f2328; stroke-width:1.5; }
+      .box-rec { fill:#dafbe1; stroke:#1a7f37; stroke-width:2; }
+      .box-warn { fill:#fff8c5; stroke:#d4a017; stroke-width:1.5; }
+      .title { font:bold 14px -apple-system, sans-serif; fill:#1f2328; }
+      .sub   { font:11px -apple-system, sans-serif; fill:#57606a; }
+      .arrow { stroke:#1f2328; stroke-width:1.5; fill:none; marker-end:url(#arr); }
+      .grp   { font:bold 12px -apple-system, sans-serif; fill:#4c8bf5; }
+    </style>
+  </defs>
+
+  <text x="20" y="28" class="grp">输入 (Inputs)</text>
+  <rect x="20" y="44" width="190" height="86" class="box" rx="6"/>
+  <text x="115" y="70" text-anchor="middle" class="title">N1.7 base 权重</text>
+  <text x="115" y="90" text-anchor="middle" class="sub">nvidia/GR00T-N1.7-3B (warm)</text>
+  <text x="115" y="106" text-anchor="middle" class="sub">或 Cosmos-Reason2-2B (cold)</text>
+  <text x="115" y="122" text-anchor="middle" class="sub">本地已缓存 ✓</text>
+
+  <rect x="20" y="150" width="190" height="86" class="box" rx="6"/>
+  <text x="115" y="176" text-anchor="middle" class="title">OpenCabinet 数据</text>
+  <text x="115" y="196" text-anchor="middle" class="sub">target/human 500 demos</text>
+  <text x="115" y="212" text-anchor="middle" class="sub">LeRobot 格式 (已转好)</text>
+  <text x="115" y="228" text-anchor="middle" class="sub">state16 / action12 / 3cam</text>
+
+  <path class="arrow" d="M215,87 L265,120"/>
+  <path class="arrow" d="M215,193 L265,160"/>
+
+  <text x="300" y="28" class="grp">训练 (Train · lerobot/gr00t env)</text>
+  <rect x="270" y="60" width="220" height="120" class="box-rec" rx="6"/>
+  <text x="380" y="86" text-anchor="middle" class="title">launch_finetune_n17</text>
+  <text x="380" y="108" text-anchor="middle" class="sub">冻 VLM · 训 action head</text>
+  <text x="380" y="124" text-anchor="middle" class="sub">bf16 + adafactor + grad-ckpt</text>
+  <text x="380" y="140" text-anchor="middle" class="sub">global_batch=8 accum=4</text>
+  <text x="380" y="156" text-anchor="middle" class="sub">save_steps=500 → ckpt-N</text>
+  <text x="380" y="172" text-anchor="middle" class="sub">~3.5 s/step (4090)</text>
+
+  <path class="arrow" d="M495,120 L545,120"/>
+  <rect x="550" y="80" width="180" height="80" class="box" rx="6"/>
+  <text x="640" y="108" text-anchor="middle" class="title">checkpoint-N/</text>
+  <text x="640" y="130" text-anchor="middle" class="sub">model.safetensors</text>
+  <text x="640" y="148" text-anchor="middle" class="sub">+ experiment_cfg/</text>
+
+  <text x="760" y="28" class="grp">边训边评 (Eval)</text>
+  <path class="arrow" d="M735,120 L785,120"/>
+  <rect x="790" y="60" width="170" height="120" class="box-warn" rx="6"/>
+  <text x="875" y="86" text-anchor="middle" class="title">watchdog.sh</text>
+  <text x="875" y="108" text-anchor="middle" class="sub">单 GPU 串行：</text>
+  <text x="875" y="124" text-anchor="middle" class="sub">杀训练 → 腾显存</text>
+  <text x="875" y="140" text-anchor="middle" class="sub">→ eval server N 轮</text>
+  <text x="875" y="156" text-anchor="middle" class="sub">→ CSV → resume</text>
+  <text x="875" y="172" text-anchor="middle" class="sub">crash 自动续训</text>
+
+  <path class="arrow" d="M875,182 L875,250 L380,250 L380,182"/>
+  <text x="600" y="245" text-anchor="middle" class="sub">eval 完 resume 训练（loop 到 MAX_STEPS）</text>
+
+  <text x="20" y="280" class="grp">评估管线复用 (Reuse)</text>
+  <rect x="20" y="290" width="940" height="26" class="box" rx="6"/>
+  <text x="490" y="308" text-anchor="middle" class="sub">eval server (robocasa_gr00t env, Gr00tPolicy) ⇄ ZMQ ⇄ sim client scripts/_gr00t_eval_client.py (robocasa env) —— 与 N1.5 / ACT 同一协议，零修改</text>
+</svg>
+
+<h2>4. 模型与数据规格 (Model & Data Schema)</h2>
+
+<h3>4.1 base 模型两条路</h3>
+
+<table>
+  <thead>
+    <tr><th>路径</th><th>base_model_path</th><th>起点</th><th>建议</th></tr>
+  </thead>
+  <tbody>
+    <tr class="recommend">
+      <td>Warm start（推荐）</td>
+      <td><code>nvidia/GR00T-N1.7-3B</code></td>
+      <td>官方 N1.7 预训练 VLA（已有 embodied 先验）</td>
+      <td><strong>首选</strong>：action head 已是机器人动作分布，单任务微调收敛快</td>
+    </tr>
+    <tr>
+      <td>Cold start</td>
+      <td><code>nvidia/Cosmos-Reason2-2B</code></td>
+      <td>纯 VLM backbone，action head 随机初始化</td>
+      <td>复现 hi-space SOTA 配方时用；收敛慢，本仓没必要</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="ok">两个 base 模型 <strong>本地 HF cache 已存在</strong>：<code>~/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B</code> 和 <code>models--nvidia--Cosmos-Reason2-2B</code>，不用重新下载。</div>
+
+<h3>4.2 数据规格（与 N1.5 / ACT 完全一致）</h3>
+
+<p>RoboCasa OpenCabinet 用 GR00T 内置 <code>panda_omron</code> data config，state/action 布局如下（来自数据集 <code>meta/modality.json</code>）：</p>
+
+<table>
+  <thead><tr><th>组</th><th>键</th><th>维度</th></tr></thead>
+  <tbody>
+    <tr><td rowspan="5"><strong>state (16)</strong></td><td>base_position</td><td>[0:3]</td></tr>
+    <tr><td>base_rotation</td><td>[3:7]</td></tr>
+    <tr><td>end_effector_position_relative</td><td>[7:10]</td></tr>
+    <tr><td>end_effector_rotation_relative</td><td>[10:14]</td></tr>
+    <tr><td>gripper_qpos</td><td>[14:16]</td></tr>
+    <tr><td rowspan="5"><strong>action (12)</strong></td><td>base_motion</td><td>[0:4]</td></tr>
+    <tr><td>control_mode</td><td>[4:5]</td></tr>
+    <tr><td>end_effector_position</td><td>[5:8]</td></tr>
+    <tr><td>end_effector_rotation</td><td>[8:11]</td></tr>
+    <tr><td>gripper_close</td><td>[11:12]</td></tr>
+    <tr><td><strong>video (3)</strong></td><td>robot0_agentview_left / _right / eye_in_hand</td><td>各 256², resize 224²</td></tr>
+    <tr><td><strong>language</strong></td><td>annotation.human.task_description</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<div class="warn"><strong>关键适配点：action_horizon</strong>。N1.7 的 <code>Gr00tN1d7Config</code> 默认 <code>action_horizon=40</code>，数据侧 action <code>delta_indices</code> 必须对齐 <code>range(40)</code>（data loader 用 <code>horizon = max(delta)−min(delta)+1</code> 推）。<code>panda_omron</code> 内置配置的 action_indices 可能是 16（N1.5 时代），<strong>微调 N1.7 前需把它改成 40</strong>——这正是 LeIsaac <code>leisaac_config_n17.py</code> 相对 N1.6 唯一的核心改动（<code>range(16)→range(40)</code>）。<span class="en">N1.7 hard-defaults action_horizon=40; the data-side delta_indices must match. This is the one change to carry over.</span></div>
+
+<h2>5. 边训边 eval：单 GPU 串行 watchdog (Train-while-eval)</h2>
+
+<p>本机只有一张 4090，训练已占满 22.4 GB——<strong>不可能训练和 eval 同时跑</strong>。LeIsaac 的 <code>watchdog.sh</code> 解法是<strong>时间分片串行</strong>，符合"长训必须分 slice + watcher"的铁律：</p>
+
+<svg viewBox="0 0 960 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="watchdog serial loop">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <style>
+      .b { fill:#f6f8fa; stroke:#1f2328; stroke-width:1.5; }
+      .bt { fill:#dafbe1; stroke:#1a7f37; stroke-width:2; }
+      .be { fill:#fff8c5; stroke:#d4a017; stroke-width:1.5; }
+      .bk { fill:#ffebe9; stroke:#cf222e; stroke-width:1.5; }
+      .t { font:bold 13px -apple-system, sans-serif; fill:#1f2328; }
+      .s { font:11px -apple-system, sans-serif; fill:#57606a; }
+      .a { stroke:#1f2328; stroke-width:1.5; fill:none; marker-end:url(#arr2); }
+    </style>
+  </defs>
+
+  <rect x="20" y="40" width="160" height="70" class="bt" rx="6"/>
+  <text x="100" y="66" text-anchor="middle" class="t">① 训练一段</text>
+  <text x="100" y="86" text-anchor="middle" class="s">train.sh 到 save_steps</text>
+  <text x="100" y="102" text-anchor="middle" class="s">或崩溃 / MAX_STEPS</text>
+
+  <path class="a" d="M182,75 L222,75"/>
+  <rect x="225" y="40" width="160" height="70" class="bk" rx="6"/>
+  <text x="305" y="66" text-anchor="middle" class="t">② 杀进程</text>
+  <text x="305" y="86" text-anchor="middle" class="s">pkill train + eval 残留</text>
+  <text x="305" y="102" text-anchor="middle" class="s">wait_gpu_free &lt;3GB</text>
+
+  <path class="a" d="M387,75 L427,75"/>
+  <rect x="430" y="40" width="170" height="70" class="be" rx="6"/>
+  <text x="515" y="62" text-anchor="middle" class="t">③ eval 未评 ckpt</text>
+  <text x="515" y="82" text-anchor="middle" class="s">起 Gr00tPolicy server</text>
+  <text x="515" y="98" text-anchor="middle" class="s">跑 N 轮 → 写 CSV</text>
+
+  <path class="a" d="M602,75 L642,75"/>
+  <rect x="645" y="40" width="160" height="70" class="bk" rx="6"/>
+  <text x="725" y="66" text-anchor="middle" class="t">④ 杀 eval</text>
+  <text x="725" y="86" text-anchor="middle" class="s">腾显存</text>
+  <text x="725" y="102" text-anchor="middle" class="s">drop optimizer.pt</text>
+
+  <path class="a" d="M725,112 L725,150 L100,150 L100,112"/>
+  <text x="412" y="145" text-anchor="middle" class="s">resume：回 ① 续训（latest ckpt，重置 adafactor 动量），loop 到 global_step ≥ MAX_STEPS</text>
+
+  <rect x="20" y="180" width="785" height="50" class="b" rx="6"/>
+  <text x="412" y="200" text-anchor="middle" class="t">磁盘守护：双重 ckpt 剪枝</text>
+  <text x="412" y="220" text-anchor="middle" class="s">step-multiple（保留 500 倍数永久 + 最近 3 个）× loss-driven（按 train_loss 留 top-K + last）——绑定磁盘上限</text>
+</svg>
+
+<h4>watchdog 的几个硬核设计（都是踩坑换来的）</h4>
+<ul>
+  <li><strong>串行而非并行</strong>：eval 前 <code>wait_gpu_free 3000 90</code> 等 CUDA 驱动真正释放（python 退出后显存还会驻留 ~30 s），必要时 <code>nvidia-smi --gpu-reset</code> 兜底。</li>
+  <li><strong>crash 自动续训</strong>：4090 上 N1.x 训练会随机 <code>d.is_cuda() INTERNAL ASSERT</code> 崩。watchdog resume 前 <code>mv optimizer.pt → .bak</code>（丢 adafactor 动量，~50 step 恢复），避免 optimizer.pt 撑爆 transient 显存。</li>
+  <li><strong>eval 阈值自适应</strong>：早期 ckpt 跑 fast（3 轮），后期跑 full（6 轮），省早期无意义的 eval 时间。</li>
+  <li><strong>跳过已评</strong>：CSV 第一列记 step，已评的 ckpt 不重复跑。</li>
+  <li><strong>save_steps 强制对齐</strong>：HF Trainer resume 时会用 <code>trainer_state.json</code> 里的 save_steps 覆盖 CLI，watchdog 每次 resume 前 patch 一遍。</li>
+</ul>
+
+<h2>6. GPU 预算 (Budget)</h2>
+
+<table>
+  <thead>
+    <tr><th>GPU</th><th>profile</th><th>step time</th><th>OpenCabinet 单任务（~8k step）</th><th>显存</th></tr>
+  </thead>
+  <tbody>
+    <tr class="recommend">
+      <td>RTX 4090 24G（本机）</td>
+      <td>small24（adafactor+grad-ckpt，<strong>micro-batch=1</strong>）</td>
+      <td>~4.3 s/step（实测 smoke，3 cam）</td>
+      <td><strong>~9.5 h</strong>（8k step + eval 串行开销）</td>
+      <td>&lt; 22 GB</td>
+    </tr>
+    <tr>
+      <td>A100 / L40 48G（AutoDL ¥7.5/h）</td>
+      <td>big48（adamw，无 grad-ckpt）</td>
+      <td>~1.2 s/step（估）</td>
+      <td>~2.7 h · ~¥20</td>
+      <td>~35 GB</td>
+    </tr>
+    <tr>
+      <td>RTX PRO 6000 96G（AutoDL）</td>
+      <td>big96（adamw，batch 32）</td>
+      <td>~0.6 s/step（估）</td>
+      <td>~1.4 h</td>
+      <td>~62 GB</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note"><code>train_n17.sh</code> 用 <code>nvidia-smi</code> 自动探测显存选 profile（&lt;30G→small24，30-60G→big48，&gt;60G→big96），大卡自动关 grad-ckpt + 换 adamw + 加大 batch。<strong>本机一晚就能跑完单任务微调 + 全程 eval 曲线。</strong><span class="en">GPU profile auto-detected from VRAM. A single 4090 finishes one task overnight, eval curve included.</span></div>
+
+<h2>7. 落地步骤 (Step-by-Step)</h2>
+
+<div class="ok"><strong>前置依赖（已落地，自包含）</strong>：N1.7 需要带 <code>gr00t_n1d7</code> 的 Isaac-GR00T，而父仓 <code>mujoco-experience/dependencies/Isaac-GR00T</code> 是 robocasa-benchmark 的 <strong>N1.5 fork（含 <code>panda_omron</code>，给 70% eval 用，不动）</strong>，没有 N1.7。因此本训练仓<strong>自带一份 N1.7 依赖作为 submodule</strong>：<code>robocasa-training/dependencies/Isaac-GR00T</code> → NVIDIA 上游 pin 在 <code>n1.7-release</code>(<code>23ace64</code>)。<strong>已与外部项目完全脱钩</strong>（repack 本地化对象 + 删 alternates，<code>git fsck</code> 通过）。<span class="en">N1.7 Isaac-GR00T is vendored as a submodule inside this training repo (pinned to n1.7-release, fully dissociated from any sibling project). The parent's N1.5 fork — needed for the working 70% eval — stays untouched.</span></div>
+<div class="note"><strong>两棵树各司其职</strong>（与 isaaclab 自身做法一致）：<code>mujoco-experience/dependencies/Isaac-GR00T</code>（N1.5 fork）跑 <strong>N1.5/N1.7 eval 的 RoboCasa panda_omron 管线</strong>；<code>robocasa-training/dependencies/Isaac-GR00T</code>（N1.7 上游）跑 <strong>N1.7 训练</strong>。N1.7 上游<strong>原生支持 RoboCasa 需要的 <code>ActionFormat.XYZ_ROT6D</code></strong>，所以训练侧不需要 fork 任何 RoboCasa 代码，只需注册一个 modality config（见步骤 2）。<span class="en">N1.7 upstream natively supports XYZ_ROT6D, so no RoboCasa fork code needs porting — just register a modality config.</span></div>
+
+<div class="ok"><strong>已就位（2026-05-29 实测跑通）</strong>：脚本全部移植进 <code>scripts/</code>，conda env <code>gr00t-n17</code> 已建，<code>train_n17.sh</code> 已做 2-step end-to-end smoke（warm-start 加载 N1.7 → 数据集 + modality config → 前向反向 → 存 checkpoint-2，<code>train_loss=1.16</code>）。下面命令可直接用。<span class="en">All scripts ported, gr00t-n17 env built, train_n17.sh passed a 2-step end-to-end smoke. The commands below are ready to run.</span></div>
+
+<h4>步骤 1 ── conda env（一次性）</h4>
+<pre><code># 基座 clone 一个有 torch 2.7.1+cu128 + flash-attn 的 env（如 fastwam），省去 flash-attn 编译：
+conda create -y -n gr00t-n17 --clone fastwam
+conda activate gr00t-n17
+pip install -e robocasa-training/dependencies/Isaac-GR00T --no-deps
+pip install transformers==4.57.3 diffusers==0.35.1 tyro==0.9.17 albumentations==1.4.18 dm-tree
+# 验证：python -c "import gr00t.model.gr00t_n1d7"  应无报错。</code></pre>
+
+<h4>步骤 2 ── 确认数据集 + modality config</h4>
+<pre><code># 训练吃带 meta/modality.json 的 v2.1 目录（lerobot_old，不是新的 lerobot/）：
+ls ~/.cache/robocasa/datasets/v1.0/target/atomic/OpenCabinet/20250813/lerobot_old/meta/modality.json
+# modality config 已写好（scripts/robocasa_config_n17.py）：panda_omron 键 + action_horizon=40
+#   + 全 action 用 rep=ABSOLUTE（RoboCasa 动作已是 delta，不再 relativize）。</code></pre>
+
+<h4>步骤 3 ── 启动边训边 eval（单 4090，默认值已对）</h4>
+<pre><code>cd robocasa-training
+MAX_STEPS=8000 SAVE_STEPS=500 EVAL_STEPS_MULTIPLE=1000 \
+bash scripts/watchdog_gr00t.sh
+# 默认：BASE_MODEL=nvidia/GR00T-N1.7-3B（warm），CONDA_ENV=gr00t-n17，
+#       DATASET=.../OpenCabinet/.../lerobot_old，OUTPUT=checkpoints/gr00t_n17_opencabinet。
+# watchdog：训 1000 step → 杀进程腾显存 → eval_gr00t_n17.py 跑 10 ep 写 CSV → resume，loop 到 8000。
+#           crash 自动续训，磁盘双重剪枝。SR 曲线在 logs/gr00t_n17_ckpts.csv。</code></pre>
+
+<div class="note"><strong>两个本机踩坑（已在 train_n17.sh 里默认修好）</strong>：① launcher 的 <code>torch.compile(action_head)</code> 在 torch 2.7.1 inductor 上炸（<code>'aten' object has no attribute 'map'</code>）—— 纯提速 patch，默认 <code>COMPILE_ACTION_HEAD_DISABLE=1</code> 关掉。② RoboCasa 是 <strong>3 个相机</strong>（LeIsaac 才 2 个）+ 桌面 gnome-remote 占 0.4GB，micro-batch=2 会 OOM（22.4GB 顶满）→ small24 档默认 <strong>micro-batch=1</strong>（global 4 / accum 4）。<span class="en">Two box-specific fixes baked into train_n17.sh: disable torch.compile (inductor bug on torch 2.7.1) and drop to micro-batch=1 (3 cameras + desktop VRAM OOM at micro-batch=2).</span></div>
+
+<h4>步骤 4 ── 单独评估某个 ckpt（N1.7 eval 管线）</h4>
+<pre><code># scripts/eval_gr00t_n17.py 起 N1.7 server（gr00t-n17 env, serve_gr00t_n17.py）
+# + 复用父仓 _gr00t_eval_client.py（robocasa env, 同 ZMQ 协议，零改）：
+python robocasa-training/scripts/eval_gr00t_n17.py \
+    --env-name OpenCabinet --split target \
+    --n-episodes 50 \
+    --ckpt robocasa-training/checkpoints/gr00t_n17_opencabinet/checkpoint-8000 \
+    --render</code></pre>
+
+<div class="ok"><strong>Linus 提醒</strong>：客户端一行新协议都没写。N1.7 推理同样是 <code>obs → action dict</code>，复用父仓 <code>_gr00t_eval_client.py</code>（同 ZMQ pickle 协议）。新增的只有 <code>serve_gr00t_n17.py</code>（N1.7 的 <code>Gr00tPolicy</code> API + 解包 <code>(action, info)</code> 元组）和瘦 orchestrator <code>eval_gr00t_n17.py</code>。N1.7 的 modality config 从 <strong>checkpoint 的 processor 读</strong>，不需要 <code>panda_omron</code> DATA_CONFIG。<span class="en">Client reused verbatim; only a thin N1.7 server + orchestrator are new. N1.7 reads its modality config from the checkpoint's processor.</span></div>
+<div class="warn"><strong>eval 待运行时验证</strong>：server/orchestrator 已写好且 import 通过，但 eval 全链路（obs 键对齐 + closed-loop SR）还没用真 ckpt 实跑过。第一个 checkpoint 出来后，先按 <a href="#">开环 replay 探针</a>的纪律确认预测 vs 记录动作 L1 合理，再信 SR 数字。<span class="en">The N1.7 eval server + orchestrator are written and import-clean but not yet run against a real checkpoint end-to-end — validate with an open-loop replay probe once the first ckpt lands.</span></div>
+
+<h2>8. 复用的 LeIsaac 资产 (Reused Assets)</h2>
+
+<table>
+  <thead><tr><th>scripts/ 文件</th><th>作用</th><th>来源 / RoboCasa 改动</th></tr></thead>
+  <tbody>
+    <tr><td><code>launch_finetune_n17.py</code></td><td>N1.7 trainer 包装：冻 backbone、grad-ckpt use_reentrant=False、ckpt 双重剪枝、cold/warm start 自动判别</td><td>移植自 LeIsaac；改 GR00T_ROOT 默认指本仓 submodule + <code>use_relative_action=False</code>（RoboCasa delta）</td></tr>
+    <tr><td><code>train_n17.sh</code></td><td>GPU profile 自动探测、显存压榨、conda 激活</td><td>移植；改 dataset/output/modality 路径、<strong>uv→conda gr00t-n17</strong>、small24 micro-batch=1、compile 默认关</td></tr>
+    <tr><td><code>watchdog_gr00t.sh</code></td><td>单 GPU 串行 eval + crash 自动续训 + 磁盘剪枝</td><td>移植；eval 段改调 <code>eval_gr00t_n17.py</code> 解析 success_rate</td></tr>
+    <tr><td><code>robocasa_config_n17.py</code></td><td>modality config：panda_omron 键 + action_horizon=40 + rep=ABSOLUTE</td><td><strong>新写</strong>（仿 leisaac_config_n17，N1.7 原生 ActionConfig）</td></tr>
+    <tr><td><code>serve_gr00t_n17.py</code></td><td>N1.7 ZMQ 推理 server（<code>Gr00tPolicy</code> + 解包 (action,info)）</td><td><strong>新写</strong>（对接现有 client 协议）</td></tr>
+    <tr><td><code>eval_gr00t_n17.py</code></td><td>eval orchestrator：起 server(gr00t-n17) + client(robocasa)</td><td><strong>新写</strong>（仿 robocasa_eval_gr00t.py）</td></tr>
+    <tr><td><code>lisa_callback.py</code></td><td>LISA 层采样（可选，进一步省显存）</td><td>移植；4090 默认不需要</td></tr>
+  </tbody>
+</table>
+
+<h2>9. 成功标准 (Success Criteria)</h2>
+
+<table>
+  <thead><tr><th>阶段</th><th>指标</th><th>阈值</th></tr></thead>
+  <tbody>
+    <tr><td>训练收敛</td><td>action diffusion loss</td><td>稳定下降并 plateau（warm start 起点远低于 cold）</td></tr>
+    <tr><td>边训 eval</td><td>OpenCabinet SR 随 step 单调上升</td><td>watchdog CSV 看到上升趋势即方向对</td></tr>
+    <tr><td>最终 eval SR</td><td>OpenCabinet success rate (50 ep)</td><td><strong>≥ 70%</strong>（对标 N1.5 multitask）</td></tr>
+    <tr><td>对照意义</td><td>vs ACT 0% / vs N1.5 70%</td><td>证明"单任务专精微调 ≥ 多任务泛化"</td></tr>
+  </tbody>
+</table>
+
+<h2>10. 三问自检 (Linus Three Questions)</h2>
+
+<ul>
+  <li><strong>真问题还是假想？</strong> ✅ 真：ACT 0% 已证明小模型不行，N1.5 70% 已证明 VLA 路线对。N1.7 单任务微调能否超过 N1.5 多任务，是有商业/技术价值的真问题。</li>
+  <li><strong>有更简单方案吗？</strong> ⚠️ 直接评 N1.5 ckpt 更简单（已 70%），但那是泛化值不是上限。微调是为了拿单任务上限，配方已被 LeIsaac 跑通，移植成本低。</li>
+  <li><strong>会破坏什么吗？</strong> ❌ 不会：评估端 100% 复用 N1.5 的 ZMQ server/client；训练全在 robocasa-training 仓内新增脚本；唯一外部依赖是换一个带 <code>gr00t_n1d7</code> 的 Isaac-GR00T（不动现有 N1.5 评估环境）。</li>
+</ul>
+
+<div class="ok"><strong>结论</strong>：✅ 值得。配方现成（LeIsaac N1.7），数据现成（OpenCabinet 500 demo 已转 LeRobot），base 现成（本地缓存），eval 管线现成（N1.5 同协议）。唯一新工作是移植 4 个脚本 + 换 Isaac-GR00T 版本。<span class="en">Worth it. Recipe, data, base model, and eval pipeline all already exist — the only new work is porting 4 scripts and swapping the Isaac-GR00T version.</span></div>
+
+</body>
+</html>

@@ -8,3 +8,5 @@ checkpoints/
 wandb/
 .DS_Store
 logs/
+results/
+hf_release/
