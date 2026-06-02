@@ -54,6 +54,11 @@ MODALITY_CFG="${MODALITY_CFG:-$REPO_ROOT/scripts/robocasa_config_n17.py}"
 # single-task finetune; both this and the cold Cosmos backbone are in the local HF cache.
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
 MAX_STEPS="${MAX_STEPS:-10000}"
+# LR + warmup knobs. Default 1e-4/0.05 matches the validated finetune. For a GENTLE
+# continuation off an already-converged ckpt, use a low LR (e.g. 1e-5) so resume/warm-start
+# does not shock the policy (1e-4 re-warmup tanked a 70% ckpt to 0% — see watchdog notes).
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 SAVE_STEPS="${SAVE_STEPS:-1200}"
 # save_only_model=True dropped 332/1030 weight keys interacting with tune_top_llm_layers — keep full ckpt.
 SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-0}"
@@ -197,9 +202,9 @@ GR00T_ROOT="$GR00T_ROOT" \
         --save_steps "$SAVE_STEPS" \
         --save_total_limit "$SAVE_TOTAL_LIMIT" \
         --max_steps "$MAX_STEPS" \
-        --warmup_ratio 0.05 \
+        --warmup_ratio "$WARMUP_RATIO" \
         --weight_decay 1e-5 \
-        --learning_rate 1e-4 \
+        --learning_rate "$LEARNING_RATE" \
         --global_batch_size "$GLOBAL_BATCH" \
         --gradient_accumulation_steps "$GRAD_ACCUM" \
         --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \

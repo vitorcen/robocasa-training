@@ -170,6 +170,39 @@ def _patch_loss_driven_pruning():
 _patch_loss_driven_pruning()
 
 
+# Sliced-training support: stop a training slice at STOP_AT_STEP (a boundary < max_steps)
+# so the watchdog can interleave eval, then resume. CRITICAL: we do NOT lower --max_steps
+# per slice — that would make the LR scheduler decay to ~0 at each boundary (sawtooth) and
+# corrupt training. Instead max_steps stays the FULL target (scheduler is one continuous
+# curve across all slices) and we stop early via control.should_training_stop. Resume
+# restores the scheduler state and continues on the same horizon. STOP_AT_STEP unset/0 → no-op.
+def _patch_stop_at_step():
+    stop_at = int(os.environ.get("STOP_AT_STEP", "0"))
+    if stop_at <= 0:
+        return
+    from transformers import TrainerCallback
+    from gr00t.experiment.trainer import Gr00tTrainer
+
+    class StopAtStepCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step >= stop_at:
+                control.should_save = True            # guarantee a ckpt exactly at the boundary
+                control.should_training_stop = True   # clean exit (rc=0); watchdog resumes next slice
+            return control
+
+    _orig_trainer_init = Gr00tTrainer.__init__
+
+    def _patched_trainer_init(self, *args, **kwargs):
+        _orig_trainer_init(self, *args, **kwargs)
+        self.add_callback(StopAtStepCallback())
+        print(f"[gr00t-n17-train] StopAtStepCallback installed (stop_at={stop_at}, max_steps unchanged)", flush=True)
+
+    Gr00tTrainer.__init__ = _patched_trainer_init
+
+
+_patch_stop_at_step()
+
+
 def _patch_stable_grad_clip_params():
     """Avoid re-walking the module tree during every gradient clipping step."""
     if os.environ.get("STABLE_GRAD_CLIP_PARAMS_DISABLE", "0") == "1":
@@ -455,17 +488,45 @@ if __name__ == "__main__":
     if ft_config.modality_config_path is not None:
         load_modality_config(ft_config.modality_config_path)
 
+    # Native multi-dataset mixing (good taste: no physical merge, no v2.0->v2.1
+    # format unification). GR00T's factory loads each path independently, regenerates
+    # stats, and samples shards by weight = mix_ratio. Each dataset keeps its own
+    # meta/tasks.jsonl + modality.json, so task_index/frame_index/list-vs-fixed_size
+    # differences never matter -- the model only consumes the resolved language string
+    # and the state/action tensors, which are identical across the OpenCabinet sets.
+    #
+    # PRIMARY_MIX_RATIO  weight of --dataset_path (default 1.0)
+    # EXTRA_DATASETS     comma list of "path=ratio" appended as extra mix specs.
+    #                    Empty => identical to the original single-dataset behavior.
+    datasets = [
+        {
+            "dataset_paths": [ft_config.dataset_path],
+            "mix_ratio": float(os.environ.get("PRIMARY_MIX_RATIO", "1.0")),
+            "embodiment_tag": embodiment_tag,
+        }
+    ]
+    for spec in os.environ.get("EXTRA_DATASETS", "").split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        path, _, ratio = spec.partition("=")
+        datasets.append(
+            {
+                "dataset_paths": [path.strip()],
+                "mix_ratio": float(ratio) if ratio.strip() else 1.0,
+                "embodiment_tag": embodiment_tag,
+            }
+        )
+    if len(datasets) > 1:
+        print(f"[launch_finetune_n17] mixing {len(datasets)} datasets:")
+        for d in datasets:
+            print(f"  mix_ratio={d['mix_ratio']:.3f}  {d['dataset_paths'][0]}")
+
     config = get_default_config().load_dict(
         {
             "data": {
                 "download_cache": False,
-                "datasets": [
-                    {
-                        "dataset_paths": [ft_config.dataset_path],
-                        "mix_ratio": 1.0,
-                        "embodiment_tag": embodiment_tag,
-                    }
-                ],
+                "datasets": datasets,
             }
         }
     )

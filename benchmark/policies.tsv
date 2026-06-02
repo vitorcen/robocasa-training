@@ -6,6 +6,6 @@
 #   extra_args  : any extra flags for that orchestrator (or - for none).
 # The runner appends --env-name/--split/--n-episodes/--max-steps/--results-path/--port.
 name	eval_script	ckpt	extra_args
-GR00T-N1.7-OpenCabinet	robocasa-training/scripts/eval_gr00t_n17.py	robocasa-training/checkpoints/gr00t_n17_opencabinet/checkpoint-8000	-
+GR00T-N1.7-MG2stage	robocasa-training/scripts/eval_gr00t_n17.py	robocasa-training/checkpoints/gr00t_n17_s2_humanft/checkpoint-14000	-
 GR00T-N1.5-multitask	scripts/robocasa_eval_gr00t.py	/home/david/.cache/robocasa/checkpoints/gr00t_n1-5/multitask_learning/checkpoint-120000	--data-config panda_omron --embodiment-tag new_embodiment
 pi0.5-pretrain-human300	scripts/robocasa_eval_pi05.py	/home/david/.cache/robocasa/checkpoints/pi05_pretrain_human300/multitask_learning/75000	-

@@ -6,6 +6,14 @@
 # eval + early-stop" rule): train a slice -> kill -> wait GPU drain -> eval the
 # new ckpts -> resume. On a crash it auto-resumes from the latest ckpt.
 #
+# INTERLEAVE + EARLY-STOP (default ON): instead of training straight to MAX_STEPS
+# and only evaluating at the end, the run is cut into INTERLEAVE_STEPS slices. After
+# each slice the new boundary ckpt is evaluated; if closed-loop SR stops improving for
+# EARLYSTOP_PATIENCE consecutive evals, the run stops early (the peak is already past).
+# Slices stop via a StopAtStep callback in launch_finetune_n17.py that keeps --max_steps
+# at the FULL target, so the LR scheduler is one continuous curve (no per-slice sawtooth).
+# Set INTERLEAVE_STEPS=0 for the legacy "train to MAX_STEPS, eval at end" behavior.
+#
 # Background (N1.x on 4090 24GB, bf16 + grad-ckpt): training can crash with
 # `d.is_cuda() INTERNAL ASSERT FAILED` randomly. The ckpt up to that point is
 # intact. Resume can OOM because the saved optimizer.pt blows the transient
@@ -13,17 +21,21 @@
 # loss recovers in ~50 step).
 #
 # Env:
-#   MAX_STEPS / SAVE_STEPS       target + ckpt cadence
+#   MAX_STEPS / SAVE_STEPS       final target + ckpt cadence
+#   INTERLEAVE_STEPS             slice size = eval cadence (default 1500; 0 = eval-at-end)
+#   EARLYSTOP_PATIENCE           stop after this many non-improving evals (default 3; 0 = off)
+#   EARLYSTOP_MIN_DELTA          SR gain (0-1) required to count as improvement (default 0.0)
 #   GLOBAL_BATCH / GRAD_ACCUM    passed through to train_n17.sh
-#   EVAL_STEPS_MULTIPLE          eval ckpts at multiples of this (0 = disable eval)
+#   EVAL_STEPS_MULTIPLE          eval ckpts at multiples of this (auto-aligned to INTERLEAVE_STEPS)
 #   EVAL_N_EPISODES              sim episodes per eval
+#   EVAL_MAX_STEPS               sim steps per episode (default 1200; 400 underreports slow successes)
 #   EVAL_ENV_NAME                RoboCasa task (default OpenCabinet)
 #   EVAL_ACTION_HORIZON          client n_action_steps replayed per chunk
 #   MAX_RETRIES                  max watchdog cycles before giving up
 #   OUTPUT_DIR                   train output (ckpt dir)
 #   CONDA_ENV                    N1.7 conda env (default gr00t-n17), used by train + eval
 #
-# Stops once HF Trainer reports global_step >= MAX_STEPS in trainer_state.json.
+# Stops once HF Trainer reports global_step >= MAX_STEPS, or early-stop triggers.
 
 set -uo pipefail
 
@@ -41,8 +53,8 @@ EVAL_STEPS_MULTIPLE="${EVAL_STEPS_MULTIPLE:-1000}"  # eval ckpts at multiples of
 EVAL_N_EPISODES="${EVAL_N_EPISODES:-10}"
 EVAL_ENV_NAME="${EVAL_ENV_NAME:-OpenCabinet}"
 EVAL_SPLIT="${EVAL_SPLIT:-target}"
-EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-400}"             # sim steps per episode
-EVAL_WALL_S="${EVAL_WALL_S:-1200}"                  # hard wall per eval ckpt
+EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-1200}"            # sim steps per episode (400 underreports slow successes)
+EVAL_WALL_S="${EVAL_WALL_S:-2400}"                  # hard wall per eval ckpt
 EVAL_ACTION_HORIZON="${EVAL_ACTION_HORIZON:-16}"
 EVAL_POLICY_PORT="${EVAL_POLICY_PORT:-5557}"
 CONDA_ENV="${CONDA_ENV:-gr00t-n17}"
@@ -59,12 +71,34 @@ MAX_RETRIES="${MAX_RETRIES:-2000}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/checkpoints/gr00t_n17_opencabinet}"
 EVAL_LOG="${EVAL_LOG:-$REPO_ROOT/logs/gr00t_n17_ckpts.csv}"
 
+# --- Interleave + early-stop (default ON) ---------------------------------
+INTERLEAVE_STEPS="${INTERLEAVE_STEPS:-1500}"        # slice size; 0 = legacy eval-at-end
+EARLYSTOP_PATIENCE="${EARLYSTOP_PATIENCE:-3}"       # non-improving evals before stop; 0 = off
+EARLYSTOP_MIN_DELTA="${EARLYSTOP_MIN_DELTA:-0.0}"   # SR improvement threshold (0-1)
+if (( INTERLEAVE_STEPS > 0 )); then
+    # Boundary ckpts land on INTERLEAVE_STEPS multiples; eval + keep must align to them,
+    # else the boundary ckpt is neither evaluated nor preserved. Lock both to the slice size.
+    if (( EVAL_STEPS_MULTIPLE == 0 || INTERLEAVE_STEPS % EVAL_STEPS_MULTIPLE != 0 )); then
+        EVAL_STEPS_MULTIPLE="$INTERLEAVE_STEPS"
+    fi
+    KEEP_MULTIPLE="${KEEP_MULTIPLE:-$INTERLEAVE_STEPS}"
+    if (( INTERLEAVE_STEPS % KEEP_MULTIPLE != 0 )); then
+        KEEP_MULTIPLE="$INTERLEAVE_STEPS"
+    fi
+    export KEEP_MULTIPLE
+fi
+
 WATCHDOG_LOG_DIR="$REPO_ROOT/logs/gr00t_watchdog"
 mkdir -p "$WATCHDOG_LOG_DIR"
 WATCHDOG_LOG="$WATCHDOG_LOG_DIR/watchdog_$(date +%Y%m%d_%H%M%S).log"
 
 echo "[watchdog] target=$MAX_STEPS save_steps=$SAVE_STEPS global=$GLOBAL_BATCH accum=$GRAD_ACCUM"
 echo "[watchdog] output=$OUTPUT_DIR" | tee -a "$WATCHDOG_LOG"
+if (( INTERLEAVE_STEPS > 0 )); then
+    echo "[watchdog] interleave=$INTERLEAVE_STEPS eval_mult=$EVAL_STEPS_MULTIPLE keep_mult=${KEEP_MULTIPLE:-} eval_steps=$EVAL_MAX_STEPS earlystop_patience=$EARLYSTOP_PATIENCE" | tee -a "$WATCHDOG_LOG"
+else
+    echo "[watchdog] interleave=OFF (eval at end), eval_mult=$EVAL_STEPS_MULTIPLE eval_steps=$EVAL_MAX_STEPS" | tee -a "$WATCHDOG_LOG"
+fi
 echo "[watchdog] log=$WATCHDOG_LOG"
 
 cleanup_procs() {
@@ -192,6 +226,39 @@ if removed:
 PY
 }
 
+# Early-stop signal: read EVAL_LOG, sort by step, find the running-best SR and how many
+# trailing evals failed to beat it by EARLYSTOP_MIN_DELTA. Exit 0 => stop (peak is past),
+# 1 => keep going. Needs > EARLYSTOP_PATIENCE points so a single noisy dip can't trip it.
+check_early_stop() {
+    (( EARLYSTOP_PATIENCE > 0 )) || return 1
+    [[ -f "$EVAL_LOG" ]] || return 1
+    python3 - "$EVAL_LOG" "$EARLYSTOP_PATIENCE" "$EARLYSTOP_MIN_DELTA" <<'PY'
+import sys, csv
+log, patience, min_delta = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+rows = []
+try:
+    with open(log) as f:
+        for row in csv.DictReader(f):
+            try:
+                rows.append((int(row["step"]), float(row["success_rate"])))
+            except (ValueError, KeyError, TypeError):
+                continue  # skip NaN / malformed
+except FileNotFoundError:
+    sys.exit(1)
+rows.sort()
+if len(rows) < patience + 1:
+    sys.exit(1)  # not enough evidence yet
+best = -1.0
+no_improve = 0
+for _, sr in rows:
+    if sr > best + min_delta:
+        best, no_improve = sr, 0
+    else:
+        no_improve += 1
+sys.exit(0 if no_improve >= patience else 1)
+PY
+}
+
 eval_unevaluated_ckpts() {
     # Find ckpts at multiples of EVAL_STEPS_MULTIPLE that aren't yet in EVAL_LOG.
     # Run eval one by one (GPU serial), append CSV.
@@ -200,8 +267,10 @@ eval_unevaluated_ckpts() {
     mkdir -p "$(dirname "$EVAL_LOG")"
     [[ -f "$EVAL_LOG" ]] || echo "step,n_episodes,n_completed,success_rate,n_action_steps" > "$EVAL_LOG"
 
-    for ckpt_dir in $(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sort -t- -k2 -n); do
-        local step="${ckpt_dir##*/checkpoint-}"
+    # Sort by the numeric step (sed first), NOT `sort -t- -k2` — the output dir path can
+    # contain dashes (e.g. mujoco-experience) which scrambles a dash-delimited sort.
+    for step in $(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's|.*/checkpoint-||' | sort -n); do
+        local ckpt_dir="$OUTPUT_DIR/checkpoint-$step"
         (( step % EVAL_STEPS_MULTIPLE == 0 )) || continue
         # Skip if already evaluated (step appears as first CSV column)
         if awk -F, -v s="$step" 'NR>1 && $1==s {found=1} END{exit !found}' "$EVAL_LOG" 2>/dev/null; then
@@ -273,6 +342,13 @@ while (( stall < MAX_STALL && retry < MAX_RETRIES )); do
     # without waiting for next cycle to crash).  Skips ckpts already in CSV.
     eval_unevaluated_ckpts
 
+    # Step 2b: EARLY-STOP — if SR has stopped improving for EARLYSTOP_PATIENCE evals, the
+    # peak is behind us; stop (the best ckpt is preserved by KEEP_MULTIPLE pruning).
+    if (( INTERLEAVE_STEPS > 0 )) && check_early_stop; then
+        echo "[watchdog] ✋ EARLY-STOP — closed-loop SR did not improve for $EARLYSTOP_PATIENCE consecutive evals (peak is past)" | tee -a "$WATCHDOG_LOG"
+        break
+    fi
+
     # Step 3: cleanup eval procs + WAIT for GPU memory to actually drain
     # (CUDA driver may keep ~7-9 GB resident for ~30s after python proc dies)
     pkill -f "serve_gr00t_n17\|_gr00t_eval_client" 2>/dev/null
@@ -302,9 +378,24 @@ while (( stall < MAX_STALL && retry < MAX_RETRIES )); do
     wait_gpu_free 1800 120 | tee -a "$WATCHDOG_LOG"
     sleep "${RELAUNCH_SETTLE_S:-15}"
 
-    # Step 6: train (until next crash or MAX_STEPS)
+    # Step 5c: compute this slice's stop boundary. STOP_AT_STEP is the next INTERLEAVE_STEPS
+    # multiple above the resumed step, capped at MAX_STEPS. The launcher's StopAtStep callback
+    # stops the slice there while keeping --max_steps at the full target (scheduler intact).
+    # INTERLEAVE_STEPS=0 → STOP_AT_STEP=0 → no callback → train straight to MAX_STEPS.
+    base_step=${actual_step:-0}
+    base_step=${base_step:-0}
+    if (( INTERLEAVE_STEPS > 0 )); then
+        slice_target=$(( ( base_step / INTERLEAVE_STEPS + 1 ) * INTERLEAVE_STEPS ))
+        (( slice_target > MAX_STEPS )) && slice_target=$MAX_STEPS
+    else
+        slice_target=0
+    fi
+
+    # Step 6: train (until StopAtStep boundary, next crash, or MAX_STEPS)
     cycle_log="$WATCHDOG_LOG_DIR/cycle_${retry}_$(date +%H%M%S).log"
+    [[ "$slice_target" != "0" ]] && echo "  [watchdog] slice: $base_step → $slice_target (target $MAX_STEPS)" | tee -a "$WATCHDOG_LOG"
     MAX_STEPS="$MAX_STEPS" SAVE_STEPS="$SAVE_STEPS" \
+        STOP_AT_STEP="$slice_target" \
         GLOBAL_BATCH="$GLOBAL_BATCH" GRAD_ACCUM="$GRAD_ACCUM" \
         OUTPUT_DIR="$OUTPUT_DIR" \
         bash "$REPO_ROOT/scripts/train_n17.sh" >"$cycle_log" 2>&1
@@ -316,13 +407,24 @@ while (( stall < MAX_STALL && retry < MAX_RETRIES )); do
     prune_checkpoints | tee -a "$WATCHDOG_LOG"
 
     if [[ "$rc" == "0" ]]; then
-        echo "[watchdog] clean exit, training finished" | tee -a "$WATCHDOG_LOG"
-        # One last eval pass to cover the final ckpts
-        cleanup_procs
-        pkill -f "serve_gr00t_n17\|_gr00t_eval_client" 2>/dev/null
-        sleep 2
-        eval_unevaluated_ckpts
-        break
+        # Clean exit = either a slice boundary (interleave) or the real finish. Re-read the
+        # latest checkpoint's global_step to tell them apart.
+        fin_ckpt=$(latest_step || echo "")
+        fin_step=$(trainer_state_step "$fin_ckpt" 2>/dev/null)
+        fin_step=${fin_step:-0}
+        if (( fin_step >= MAX_STEPS )); then
+            echo "[watchdog] clean exit, training finished (step=$fin_step)" | tee -a "$WATCHDOG_LOG"
+            # One last eval pass to cover the final ckpts
+            cleanup_procs
+            pkill -f "serve_gr00t_n17\|_gr00t_eval_client" 2>/dev/null
+            sleep 2
+            eval_unevaluated_ckpts
+            break
+        else
+            echo "[watchdog] slice boundary at step=$fin_step (< $MAX_STEPS) — eval + resume next slice" | tee -a "$WATCHDOG_LOG"
+            # Loop continues: top-of-loop eval_unevaluated_ckpts evaluates this boundary
+            # ckpt, then early-stop is checked, then the next slice trains.
+        fi
     fi
     sleep 2
 done
