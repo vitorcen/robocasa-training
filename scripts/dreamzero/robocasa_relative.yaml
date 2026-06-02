@@ -1,0 +1,179 @@
+# @package _global_
+# DreamZero training config for RoboCasa OpenCabinet (PandaOmron).
+# Drop into dreamzero-repo/groot/vla/configs/data/dreamzero/robocasa_relative.yaml
+# so Hydra picks it via `data=dreamzero/robocasa_relative`.
+# Adapted from leisaac_relative.yaml: embodiment xdof->robocasa_panda_omron, 2->3 views,
+# SO-101 6d -> PandaOmron 16d state / 12d action, 30->20 fps.
+
+defaults:
+  - dreamzero/base_48_wan_fine_aug_relative
+  - _self_
+
+max_state_dim: 64
+use_global_metadata: false
+relative_action: true
+relative_action_per_horizon: false
+# Only eef_pos is relative (dimension-safe: state & action eef_pos both 3-dim).
+relative_action_keys:
+  - eef_pos
+max_chunk_size: 5
+dataset_shard_sampling_rate: 0.1
+mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
+single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+
+# Path overridden via CLI: robocasa_data_root=/root/autodl-tmp/opencabinet
+robocasa_data_root: ???
+
+################################################################################
+# robocasa_panda_omron (RoboCasa OpenCabinet: mobile base + 1 arm + gripper,
+#   3 cams, 20 fps, 500 demo). state 16d, action 12d, 3 views.
+################################################################################
+
+modality_config_robocasa_panda_omron:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.robot0_agentview_left
+      - video.robot0_agentview_right
+      - video.robot0_eye_in_hand
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.base_pos
+      - state.base_rot
+      - state.eef_pos
+      - state.eef_rot
+      - state.gripper_qpos
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.base_motion
+      - action.ctrl_mode
+      - action.eef_pos
+      - action.eef_rot
+      - action.gripper_close
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.task
+
+transform_robocasa_panda_omron:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    # Video transforms
+    - _target_: groot.vla.data.transform.VideoToTensor
+      apply_to: ${modality_config_robocasa_panda_omron.video.modality_keys}
+    - _target_: groot.vla.data.transform.VideoCrop
+      apply_to: ${modality_config_robocasa_panda_omron.video.modality_keys}
+      scale: 0.95
+      mode: random
+    - _target_: groot.vla.data.transform.VideoResize
+      apply_to: ${modality_config_robocasa_panda_omron.video.modality_keys}
+      height: ${image_resolution_height}
+      width: ${image_resolution_width}
+      interpolation: linear
+    - _target_: groot.vla.data.transform.VideoColorJitter
+      apply_to: ${modality_config_robocasa_panda_omron.video.modality_keys}
+      brightness: 0.3
+      contrast: 0.4
+      saturation: 0.5
+      hue: 0.08
+    - _target_: groot.vla.data.transform.VideoToNumpy
+      apply_to: ${modality_config_robocasa_panda_omron.video.modality_keys}
+
+    # State transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_robocasa_panda_omron.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_robocasa_panda_omron.state.modality_keys}
+      normalization_modes:
+        state.base_pos: q99
+        state.base_rot: q99
+        state.eef_pos: q99
+        state.eef_rot: q99
+        state.gripper_qpos: q99
+
+    # Action transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_robocasa_panda_omron.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_robocasa_panda_omron.action.modality_keys}
+      normalization_modes:
+        action.base_motion: q99
+        action.ctrl_mode: q99
+        action.eef_pos: q99
+        action.eef_rot: q99
+        action.gripper_close: q99
+
+    # ConcatTransform
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_robocasa_panda_omron.video.modality_keys}
+      state_concat_order: ${modality_config_robocasa_panda_omron.state.modality_keys}
+      action_concat_order: ${modality_config_robocasa_panda_omron.action.modality_keys}
+
+    # Model-specific transform
+    - ${model_specific_transform}
+
+################################################################################
+# Register robocasa_panda_omron into the dispatch dicts (preserve existing)
+################################################################################
+
+modality_configs:
+  oxe_droid: ${modality_config_oxe_droid}
+  agibot: ${modality_config_agibot}
+  yam: ${modality_config_yam}
+  robocasa_panda_omron: ${modality_config_robocasa_panda_omron}
+
+transforms:
+  oxe_droid: ${transform_oxe_droid}
+  agibot: ${transform_agibot}
+  yam: ${transform_yam}
+  robocasa_panda_omron: ${transform_robocasa_panda_omron}
+
+metadata_versions:
+  oxe_droid: '0221'
+  agibot: '0221'
+  yam: '0221'
+  robocasa_panda_omron: '0221'
+
+fps:
+  yam: 30
+  robocasa_panda_omron: 20
+
+################################################################################
+# Train dataset spec
+################################################################################
+
+train_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        robocasa_panda_omron:
+          - ${robocasa_data_root}
+      dataset_weight: 1.0
+      distribute_weights: true
+
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    # RoboCasa mp4 is already h264 -> decord reads it directly, no AV1 re-encode needed.
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}

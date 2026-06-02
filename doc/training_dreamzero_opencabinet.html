@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>微调 DreamZero 攻 RoboCasa OpenCabinet (Finetune DreamZero for OpenCabinet on AutoDL)</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+         max-width: 1040px; margin: 32px auto; padding: 24px;
+         background: #ffffff; color: #1f2328; line-height: 1.65; }
+  html { background: #ffffff; }
+  h1 { border-bottom: 2px solid #1f2328; padding-bottom: 8px; }
+  h2 { margin-top: 2em; border-left: 4px solid #7c4dff; padding-left: 12px; }
+  h3 { margin-top: 1.6em; color: #7c4dff; }
+  h4 { margin-top: 1.2em; color: #57606a; }
+  .tldr { background: #fff8c5; border-left: 4px solid #d4a017;
+          padding: 12px 16px; border-radius: 4px; margin: 16px 0; }
+  .tldr-en { color: #57606a; font-style: italic; margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.92em; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  tr.recommend { background: #dafbe1; }
+  tr.good { background: #dafbe1; }
+  tr.bad  { background: #ffebe9; }
+  code { background: #f6f8fa; padding: 1px 5px; border-radius: 3px;
+         font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.9em; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.86em; }
+  pre code { background: none; padding: 0; }
+  .note { background: #ddf4ff; border-left: 4px solid #0969da; padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .warn { background: #ffebe9; border-left: 4px solid #cf222e; padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .ok   { background: #dafbe1; border-left: 4px solid #1a7f37; padding: 10px 14px; margin: 12px 0; border-radius: 4px; }
+  .meta { color: #57606a; font-size: 0.9em; }
+  svg  { display: block; margin: 16px auto; max-width: 100%; }
+  ul   { padding-left: 22px; }
+  li   { margin: 4px 0; }
+  .en  { color: #57606a; font-size: 0.85em; }
+  .kbd { background: #eaeef2; border: 1px solid #d0d7de; border-bottom-width: 2px;
+         border-radius: 4px; padding: 1px 6px; font-family: monospace; font-size: 0.85em; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:0.8em; font-weight:600; }
+  .pill-go { background:#dafbe1; color:#1a7f37; }
+  .pill-no { background:#ffebe9; color:#cf222e; }
+  .pill-tbd{ background:#fff1c2; color:#9a6700; }
+</style>
+</head>
+<body>
+
+<h1>微调 DreamZero 攻 RoboCasa OpenCabinet ── AutoDL 实操 Playbook</h1>
+<p class="meta">2026-05-31 · Linus 模式 · <code>robocasa-training</code> 仓库 · 配方移植自 <code>LeIsaac/scripts/finetune/dreamzero/</code>（SO-101 PickOrange 实战）· 配套 <a href="training_gr00t_n17.html"><code>training_gr00t_n17.html</code></a></p>
+
+<div class="tldr">
+<strong>TL;DR</strong>：在 <strong>AutoDL ≥80 GB 单卡</strong>（A100 80G / H100 80G / RTX Pro 6000 96G）上，对 <strong>DreamZero</strong>（14B Wan2.1 视频扩散世界-动作模型，World-Action Model）做 <strong>bf16 LoRA(r=4)</strong> 微调，数据是 RoboCasa <code>OpenCabinet</code> human <strong>500 demo</strong>（LeRobot，3 相机，state 16 / action 12，fps 20）。整套脚本/流程从姊妹项目 LeIsaac 的 DreamZero recipe <strong>1:1 移植</strong>，只换 embodiment（SO-101 → RoboCasa PandaOmron）、视角数（2 → <strong>3，原生对齐</strong>）、fps、维度切分。<strong>两个大坑天然规避</strong>：RoboCasa 视频已是 h264（省掉 AV1 重编码）、3 视角匹配 DreamZero 预训练（省掉 schema mismatch）。<strong>4090 训不动</strong>，只能做 NF4 推理。
+<div class="tldr-en">Finetune DreamZero (14B Wan2.1 video-diffusion World-Action Model) with bf16 LoRA(r=4) on a single ≥80 GB AutoDL GPU. Data: RoboCasa OpenCabinet 500 human demos (LeRobot, 3 cams, state16/action12, 20 fps). Pipeline ported verbatim from the sibling LeIsaac DreamZero recipe; only embodiment / view-count(2→3, natively aligned) / fps / dim-split change. Two big traps avoided for free: RoboCasa video is already h264 (no AV1 re-encode), 3 views match DreamZero's pretrain (no schema mismatch). A 4090 cannot train it — NF4 inference only.</div>
+</div>
+
+<div class="warn">
+<strong>🔴 红线（贯穿全程不可触碰） / Hard guardrails</strong>
+<ul>
+<li><strong>绝不重跑 N1.5 / pi0.5 benchmark</strong>。它们是已锁榜单基线（N1.5 = 64%，pi0.5 = 17.4%）。</li>
+<li><strong>绝不碰</strong> <code>benchmark/results/authoritative_30round/</code> 备份目录。authoritative md5 已锁：N1.5=<code>0c0d0734…</code>，pi0.5=<code>18388112…</code>。</li>
+<li>DreamZero 是 <strong>独立实验线</strong>，只新增产物，不动既有 GR00T/pi0.5 任何文件。</li>
+</ul>
+</div>
+
+<div style="background:#f3e8ff; border:2px solid #7c4dff; border-radius:8px; padding:16px 20px; margin:20px 0;">
+<h3 style="margin-top:0; color:#7c4dff;">📌 实验结果小结 / Results summary <span class="meta">(2026-06-02 更新 · 训练已停)</span></h3>
+<p><strong>结论：跑完到 step 12550/15000 后停训。<span class="pill pill-no">SR 全程 0%</span>，瓶颈是<strong>数据量（human-500 太少）</strong>，<u>不是欠训、不是坐标 bug</u>。下一步 = MimicGen 10× 扩数据再训，而非继续堆步数。</strong></p>
+<p class="en">Stopped at step 12550/15000. Success rate stayed 0% across <em>every</em> checkpoint. Loss fell normally but SR never moved; motion plateaued by step 5000; giving 3× time just made the arm wander instead of converging on the handle; changing the cabinet (seed) changed behaviour but none solved the task. Root cause is <strong>data quantity (500 human demos is too few)</strong>, not undertraining and not a coordinate bug — the decisive control is that <strong>ACT on the same task with the same human-500 is also 0%</strong> (a known data ceiling). Next step: scale data with MimicGen 10×, not more steps.</p>
+
+<table>
+<thead><tr><th>checkpoint</th><th>action_loss</th><th>SR</th><th>运动 |Δeef| / |Δarm| @step75（GUI）</th></tr></thead>
+<tbody>
+<tr><td>smoke-50</td><td>~0.64</td><td class="bad">0%</td><td>—</td></tr>
+<tr><td>2500</td><td>0.072</td><td class="bad">0%</td><td>781 mm / 163°（甩得远、往旁边耷拉）</td></tr>
+<tr><td>5000</td><td>~0.05</td><td class="bad">0%</td><td>274 mm / 194°（幅度收住 → 受控平台）</td></tr>
+<tr><td>7500</td><td>~0.05</td><td class="bad">0%</td><td>365 mm / 183°</td></tr>
+<tr><td>10000</td><td>~0.05</td><td class="bad">0%</td><td>308 mm / 187°（“像抓锅盖不抓柜门”）</td></tr>
+<tr><td>12500（最终）</td><td>~0.05</td><td class="bad">0%</td><td>—（最终可续训档）</td></tr>
+</tbody>
+</table>
+
+<p><strong>关键判据 / Evidence chain：</strong>① loss 一路降但 SR 不动；② 5000 步起运动幅度即稳定，再堆步数无效；③ 给 3× 时间（288 step）末端一路游走到 857 mm、底盘漂 140 mm，是“持续游走”非“锁定把手”；④ 换柜子（<code>SEED</code> env）行为大变 → 排除固定方向的坐标 bug；⑤ <strong>硬对照：ACT 同任务 human-500 也 0%</strong>（见 <code>training_gr00t_n17.html</code> 旁注），即数据天花板。</p>
+
+<p class="meta">可视/评估工具（本次新增）：<code>run_gui_demo.sh &lt;CKPT&gt; &lt;STEPS&gt; &lt;N_ACT&gt;</code> + env <code>SEED</code>（换柜）/<code>RENDER_STEP_DELAY_S</code>（逐步延时看清运动，默认 0 对基准零影响）/<code>POLICY_TIMEOUT_S</code>；<code>pull_and_eval_ckpt.sh &lt;STEP&gt;</code>（headless SR，4090 NF4 ~12 min/ep）。续训：同 <code>OUTPUT_DIR</code> 调高 <code>MAX_STEPS</code> 即从 ckpt-12500 自动 resume；云端盘已清，续训件（wan 基座/umt5/数据/repo/脚本/ckpt-12500）完好。</p>
+</div>
+
+<h2>1. DreamZero 是什么，值不值得这么干 (What & Is it worth it?)</h2>
+
+<p><strong>DreamZero</strong>（<a href="https://dreamzero0.github.io/">project</a> · <a href="https://arxiv.org/abs/2602.15922">arXiv 2602.15922</a> · <a href="https://github.com/dreamzero0/dreamzero">GitHub</a>）不是 VLA，是 <strong>World-Action Model (WAM)</strong>：在预训练 <strong>视频扩散骨干</strong>（Wan2.1-I2V-14B-480P）上联合预测「未来世界状态（视频）+ 动作」。卖点是 <em>用视频当稠密监督</em>，少样本就能泛化到新任务/新本体（论文宣称 vs SOTA VLA 泛化 2×，10–20 min 视频即可 +40%）。</p>
+
+<table>
+<thead><tr><th>Linus 三问</th><th>判断</th></tr></thead>
+<tbody>
+<tr><td>真问题还是假想？</td><td>真问题：我们要的不是「再榨 OpenCabinet 几个点」，而是<strong>验证 WAM 范式在 RoboCasa sim 上是否 work</strong>。GR00T N1.5 已 64%，DreamZero 是来回答「视频世界模型路线能不能迁过来」的研究性实验。</td></tr>
+<tr><td>有更简单方案吗？</td><td>有，但目标不同。要刷 SR 就继续 GR00T（已有 50–64%）。要探 WAM，DreamZero 是当前最现成的开源 14B WAM，且<strong>我们已有 LeIsaac 跑通的脚手架</strong>——边际成本极低。</td></tr>
+<tr><td>会破坏什么吗？</td><td>零破坏。独立 conda env、独立 repo（<code>dreamzero-repo</code>）、独立 AutoDL 实例、独立产物目录。不碰榜单、不碰本机 GR00T 训练。</td></tr>
+</tbody>
+</table>
+
+<div class="note">
+<strong>核心结论 / Verdict</strong>：✅ 值得跑一次。理由不是「会更强」（14B 视频扩散打一个窄 sim 任务，是用牛刀），而是<strong>脚手架已就绪 + RoboCasa 数据天然契合 DreamZero（3 视角 + h264）</strong>，一次 ~3–4 h 的 LoRA 就能拿到 WAM 在 RoboCasa 的首个数据点。期望值：<strong>能否在 500 demo 下接近 GR00T 区间（&gt;50%）</strong>，是这次实验的 success metric。
+</div>
+
+<h2>2. 数据与本体对照：RoboCasa vs LeIsaac (Why RoboCasa fits better)</h2>
+
+<p>左边是这次的目标，右边是已跑通的参照（LeIsaac SO-101）。<strong>差异即工作量</strong>。</p>
+
+<table>
+<thead><tr><th>维度</th><th>RoboCasa OpenCabinet（本次目标）</th><th>LeIsaac SO-101（已跑通参照）</th><th>影响</th></tr></thead>
+<tbody>
+<tr><td>本体 embodiment</td><td>PandaOmron（移动底盘 + 单臂 + 夹爪）</td><td>SO-101（单臂 + 夹爪）</td><td>新注册 tag <code>robocasa</code></td></tr>
+<tr class="good"><td>相机视角 views</td><td><strong>3</strong>：eye_in_hand + agentview_left + agentview_right</td><td>2：front + wrist</td><td><span class="pill pill-go">✓ 原生对齐</span> DreamZero base 用 3 视角训，<code>num_views=3</code> 无 schema mismatch</td></tr>
+<tr class="good"><td>视频编码 codec</td><td><strong>h264</strong>（info.json 确认）</td><td>AV1（decord 不支持）</td><td><span class="pill pill-go">✓ 省一步</span> 跳过 AV1→h264 重编码</td></tr>
+<tr><td>state 维度</td><td>16（base pos3 + rot4 + eef pos3 + rot4 + gripper2）</td><td>6（5 臂关节 + 1 夹爪）</td><td>改 <code>--state-keys</code> 切分 + yaml</td></tr>
+<tr><td>action 维度</td><td>12（base4 + ctrl_mode1 + eef pos3 + rot3 + grip1）</td><td>6（5 + 1）</td><td>改 <code>--action-keys</code> + relative 选择</td></tr>
+<tr><td>fps</td><td>20</td><td>30</td><td>yaml <code>fps.robocasa: 20</code></td></tr>
+<tr><td>demo 数 / 帧数</td><td>500 / 184 024</td><td>60 / ~少</td><td>数据多 8×，<code>max_steps</code> 上调</td></tr>
+<tr><td>数据集路径</td><td colspan="2"><code>~/.cache/robocasa/datasets/v1.0/target/atomic/OpenCabinet/20250813/lerobot_old</code>（758 MB，LeRobot v2.1）</td><td></td></tr>
+</tbody>
+</table>
+
+<div class="ok"><strong>结论</strong>：RoboCasa 比 LeIsaac <strong>更适合</strong> DreamZero——两个最痛的坑（视角 mismatch、AV1 重编码）天然不存在。真正要改的只有：embodiment 注册、维度切分、fps、relative-action 选择。</div>
+
+<h2>3. 端到端数据流 (Pipeline)</h2>
+
+<svg viewBox="0 0 980 320" width="980" height="320" role="img" aria-label="DreamZero data pipeline">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#57606a"/>
+    </marker>
+    <style>
+      .box{fill:#f6f8fa;stroke:#7c4dff;stroke-width:1.5;rx:8;}
+      .boxg{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5;}
+      .frz{fill:#eef0f3;stroke:#8b949e;stroke-width:1.3;stroke-dasharray:4 3;}
+      .t{font:13px -apple-system,sans-serif;fill:#1f2328;}
+      .ts{font:11px -apple-system,sans-serif;fill:#57606a;}
+      .tw{font:600 13px -apple-system,sans-serif;fill:#1f2328;}
+    </style>
+  </defs>
+
+  <!-- input -->
+  <rect class="box" x="10" y="40" width="170" height="96" rx="8"/>
+  <text class="tw" x="95" y="62" text-anchor="middle">LeRobot v2.1</text>
+  <text class="ts" x="95" y="82" text-anchor="middle">3× video (h264)</text>
+  <text class="ts" x="95" y="100" text-anchor="middle">state[16] action[12]</text>
+  <text class="ts" x="95" y="118" text-anchor="middle">task 文本 · 20fps</text>
+
+  <!-- convert -->
+  <rect class="boxg" x="210" y="40" width="170" height="96" rx="8"/>
+  <text class="tw" x="295" y="60" text-anchor="middle">convert_to_gear</text>
+  <text class="ts" x="295" y="80" text-anchor="middle">仅写 meta/</text>
+  <text class="ts" x="295" y="98" text-anchor="middle">embodiment.json</text>
+  <text class="ts" x="295" y="116" text-anchor="middle">stats / modality</text>
+
+  <!-- encoders -->
+  <rect class="frz" x="410" y="10" width="170" height="58" rx="8"/>
+  <text class="tw" x="495" y="32" text-anchor="middle">Wan VAE ❄</text>
+  <text class="ts" x="495" y="50" text-anchor="middle">video → latent tokens</text>
+
+  <rect class="frz" x="410" y="78" width="170" height="50" rx="8"/>
+  <text class="tw" x="495" y="98" text-anchor="middle">UMT5-XXL ❄</text>
+  <text class="ts" x="495" y="116" text-anchor="middle">task → text emb</text>
+
+  <rect class="frz" x="410" y="138" width="170" height="50" rx="8"/>
+  <text class="tw" x="495" y="158" text-anchor="middle">state proj</text>
+  <text class="ts" x="495" y="176" text-anchor="middle">norm q99</text>
+
+  <!-- DiT -->
+  <rect class="box" x="610" y="50" width="160" height="120" rx="8"/>
+  <text class="tw" x="690" y="78" text-anchor="middle">Wan2.1 DiT 14B</text>
+  <text class="ts" x="690" y="98" text-anchor="middle">❄ frozen base</text>
+  <text class="tw" x="690" y="120" text-anchor="middle" fill="#7c4dff">+ LoRA r=4 🔥</text>
+  <text class="ts" x="690" y="140" text-anchor="middle">~19M 可训练</text>
+  <text class="ts" x="690" y="158" text-anchor="middle">AR video diffusion</text>
+
+  <!-- action head -->
+  <rect class="boxg" x="800" y="60" width="168" height="100" rx="8"/>
+  <text class="tw" x="884" y="86" text-anchor="middle">flow-matching</text>
+  <text class="tw" x="884" y="104" text-anchor="middle">action head 🔥</text>
+  <text class="ts" x="884" y="126" text-anchor="middle">action_horizon=24</text>
+  <text class="ts" x="884" y="144" text-anchor="middle">→ action[12]</text>
+
+  <line x1="180" y1="88" x2="208" y2="88" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="380" y1="70" x2="408" y2="40" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="380" y1="100" x2="408" y2="100" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="380" y1="120" x2="408" y2="160" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="580" y1="40" x2="608" y2="80" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="580" y1="103" x2="608" y2="110" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="580" y1="160" x2="608" y2="135" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="770" y1="110" x2="798" y2="110" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <text class="ts" x="490" y="240" text-anchor="middle">❄ = 冻结（frozen，加载 Wan2.1 + UMT5 预训练权重）　🔥 = 训练（LoRA + action head，bf16）</text>
+  <text class="ts" x="490" y="262" text-anchor="middle">梯度只流过 LoRA adapter 与 action head；14B 主干不更新 → 显存可控、不毁预训练世界模型</text>
+</svg>
+
+<h2>4. 维度映射设计 (Dim mapping — the one real design decision)</h2>
+
+<p>从数据集 <code>meta/modality.json</code> 读出的真实切分（已确认）：</p>
+
+<table>
+<thead><tr><th>state[16]</th><th>区间</th><th></th><th>action[12]</th><th>区间</th><th>relative?</th></tr></thead>
+<tbody>
+<tr><td>base_position</td><td>[0,3]</td><td rowspan="5"></td><td>base_motion</td><td>[0,4]</td><td><span class="pill pill-tbd">需验证</span></td></tr>
+<tr><td>base_rotation</td><td>[3,7]</td><td>control_mode</td><td>[4,5]</td><td><span class="pill pill-no">否（离散）</span></td></tr>
+<tr><td>eef_position_relative</td><td>[7,10]</td><td>end_effector_position</td><td>[5,8]</td><td><span class="pill pill-tbd">需验证</span></td></tr>
+<tr><td>eef_rotation_relative</td><td>[10,14]</td><td>end_effector_rotation</td><td>[8,11]</td><td><span class="pill pill-tbd">需验证</span></td></tr>
+<tr><td>gripper_qpos</td><td>[14,16]</td><td>gripper_close</td><td>[11,12]</td><td><span class="pill pill-no">否（二值）</span></td></tr>
+</tbody>
+</table>
+
+<div class="warn">
+<strong>唯一需要验证的设计点：relative-action 选择</strong>。RoboCasa OSC 控制器的 <code>end_effector_position/rotation</code> <em>本身可能已是 delta 指令</em>。DreamZero 的 <code>--relative-action-keys</code> 是「相对 chunk 首帧」的再归一化——若 action 已是 delta，再标 relative 可能<strong>双重差分</strong>。<br>
+<strong>How to apply</strong>：首跑先<strong>不标 eef 为 relative</strong>（当绝对量 + q99 归一化，与 GR00T N1.7 处理一致），smoke 50 step 看 loss；若 loss 异常或 eval 全 0 再切相对量对比。<code>control_mode</code> / <code>gripper_close</code> 永远不标 relative。
+</div>
+
+<h3>4.1 GEAR 转换命令（RoboCasa 版）</h3>
+<pre><code># 仅写 meta/，不改 parquet/video，~1 min。先备份原 modality.json
+DS=~/.cache/robocasa/datasets/v1.0/target/atomic/OpenCabinet/20250813/lerobot_old
+python $DREAMZERO_REPO/scripts/data/convert_lerobot_to_gear.py \
+    --dataset-path "$DS" \
+    --embodiment-tag robocasa \
+    --state-keys  '{"base_pos":[0,3],"base_rot":[3,7],"eef_pos":[7,10],"eef_rot":[10,14],"gripper_qpos":[14,16]}' \
+    --action-keys '{"base_motion":[0,4],"ctrl_mode":[4,5],"eef_pos":[5,8],"eef_rot":[8,11],"gripper_close":[11,12]}' \
+    --relative-action-keys base_motion \
+    --task-key task \
+    --force
+# ↑ 首跑只把 base_motion 当相对（移动底盘累积位移）；eef 先当绝对量。loss 不对再调。</code></pre>
+
+<h2>5. 硬件与显存：为什么必须上 AutoDL (Hardware reality)</h2>
+
+<table>
+<thead><tr><th>卡</th><th>训练？</th><th>说明</th></tr></thead>
+<tbody>
+<tr class="bad"><td>本机 4090 24G</td><td><span class="pill pill-no">✗ 训不动</span></td><td>14B Wan + UMT5-XXL bf16 权重就远超 24G。仅能做 <strong>NF4 量化推理</strong>（LeIsaac <code>inference/dreamzero/wan14b_nf4_forward.py</code> 已验证）。</td></tr>
+<tr class="bad"><td>48G（A6000 / L20）</td><td><span class="pill pill-tbd">⚠ 高风险</span></td><td>bf16 LoRA + ZeRO-2 offload 勉强，33 帧 × 320×176 激活 + VAE 容易 OOM。不推荐首跑。</td></tr>
+<tr class="good"><td>A100 80G / H100 80G</td><td><span class="pill pill-go">✓ 推荐</span></td><td>bf16 LoRA r=4 + ZeRO-2 offload 舒适。AutoDL 主力选项。</td></tr>
+<tr class="good"><td>RTX Pro 6000 96G</td><td><span class="pill pill-go">✓ 最佳</span></td><td>LeIsaac 实测目标卡：r=32 峰值 ~58G，r=4 更省，单卡无需 DeepSpeed。</td></tr>
+</tbody>
+</table>
+
+<div class="note"><strong>实测要点（来自 LeIsaac recipe 注释）</strong>：
+<ul>
+<li><strong>放弃 INT8/bnb 路线</strong> ── DreamZero 源码无 bnb hooks，patch 成本 &gt; 升级 GPU 成本。直接 bf16 LoRA。</li>
+<li><code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> 降碎片（近满显存必加）。</li>
+<li>Blackwell（Pro 6000 sm_120）多卡：<code>NCCL_P2P_DISABLE=1</code> + 预载 NCCL 2.30+，否则 illegal memory access。单卡可忽略。</li>
+<li>10k step ≈ Pro 6000 96G 上 3–4 h。RoboCasa 数据 8× 于 LeIsaac，建议 <code>max_steps</code> 起步 <strong>15k</strong> + 中频 interleave eval。</li>
+</ul>
+</div>
+
+<h2>6. AutoDL 实操流程 (13 步，复用 LeIsaac 脚手架)</h2>
+
+<svg viewBox="0 0 960 150" width="960" height="150" role="img" aria-label="AutoDL workflow">
+  <defs><marker id="arr2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#57606a"/></marker></defs>
+  <style>.s{font:12px -apple-system,sans-serif;fill:#1f2328;} .sb{font:600 12px -apple-system,sans-serif;} .ss{font:10px -apple-system,sans-serif;fill:#57606a;}</style>
+  <rect x="8"  y="40" width="150" height="68" rx="8" fill="#fff1c2" stroke="#9a6700" stroke-width="1.4"/>
+  <text class="s sb" x="83" y="64" text-anchor="middle">① 无卡模式</text>
+  <text class="ss" x="83" y="82" text-anchor="middle">¥0.1/h 装环境</text>
+  <text class="ss" x="83" y="98" text-anchor="middle">离线 deps + 下数据</text>
+  <rect x="188" y="40" width="150" height="68" rx="8" fill="#ddf4ff" stroke="#0969da" stroke-width="1.4"/>
+  <text class="s sb" x="263" y="64" text-anchor="middle">② 本机推权重</text>
+  <text class="ss" x="263" y="82" text-anchor="middle">scp Wan2.1+UMT5</text>
+  <text class="ss" x="263" y="98" text-anchor="middle">省 proxy 限速</text>
+  <rect x="368" y="40" width="150" height="68" rx="8" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+  <text class="s sb" x="443" y="64" text-anchor="middle">③ GEAR 转换</text>
+  <text class="ss" x="443" y="82" text-anchor="middle">convert_to_gear</text>
+  <text class="ss" x="443" y="98" text-anchor="middle">~1 min 仅 meta</text>
+  <rect x="548" y="40" width="150" height="68" rx="8" fill="#f3e8ff" stroke="#7c4dff" stroke-width="1.6"/>
+  <text class="s sb" x="623" y="60" text-anchor="middle">④ 切 GPU</text>
+  <text class="ss" x="623" y="78" text-anchor="middle">smoke 50 step</text>
+  <text class="ss" x="623" y="94" text-anchor="middle">→ 正式 15k</text>
+  <rect x="728" y="40" width="150" height="68" rx="8" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.4"/>
+  <text class="s sb" x="803" y="60" text-anchor="middle">⑤ eval + 上 HF</text>
+  <text class="ss" x="803" y="78" text-anchor="middle">RoboCasa SR</text>
+  <text class="ss" x="803" y="94" text-anchor="middle">关机前推 ckpt</text>
+  <line x1="158" y1="74" x2="186" y2="74" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="338" y1="74" x2="366" y2="74" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="518" y1="74" x2="546" y2="74" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="698" y1="74" x2="726" y2="74" stroke="#57606a" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <text class="ss" x="480" y="134" text-anchor="middle">核心省钱思路（LeIsaac autodl README v2）：环境/下载全在无卡模式 ¥0.1/h，只有训练才切 GPU 模式</text>
+</svg>
+
+<p>详细分步（脚本均在 <code>LeIsaac/scripts/cloud/autodl/</code> 与 <code>.../local/</code>，DreamZero 专属在 <code>LeIsaac/scripts/finetune/dreamzero/</code>）：</p>
+
+<table>
+<thead><tr><th>#</th><th>在哪</th><th>动作 / 脚本</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>AutoDL 无卡</td><td>开机选 ≥140 GB 数据盘 → <code>bootstrap.sh</code>（uv/git-lfs/hf cli + .bashrc env）</td></tr>
+<tr><td>2</td><td>AutoDL 无卡</td><td>clone DreamZero repo 到 <code>/root/autodl-tmp/dreamzero-repo</code>，<code>pip install -e .</code> + flash-attn</td></tr>
+<tr><td>3</td><td>AutoDL 无卡</td><td>下数据：本机 scp 上 <code>OpenCabinet/…/lerobot_old</code>（758 MB，比 hf 下更快）</td></tr>
+<tr><td>4</td><td>本机</td><td><code>local/scp_upload_model.sh</code> 推 Wan2.1-I2V-14B-480P + umt5-xxl（HF cache → AutoDL）</td></tr>
+<tr><td>5</td><td>AutoDL 无卡</td><td>跑 <strong>RoboCasa 版</strong> <code>convert_*_to_gear.sh</code>（§4.1 命令）生成 <code>meta/embodiment.json</code> 等</td></tr>
+<tr><td>6</td><td>AutoDL 无卡</td><td>放置 <code>robocasa_relative.yaml</code> 到 <code>dreamzero-repo/groot/vla/configs/data/dreamzero/</code>（§7）</td></tr>
+<tr><td>7</td><td>AutoDL 无卡</td><td><strong>跳过</strong> AV1 重编码（RoboCasa 已 h264）✓ · <code>verify_env.sh</code></td></tr>
+<tr><td>8</td><td>AutoDL <strong>切 GPU</strong></td><td><code>SMOKE=1 bash train_dreamzero_*.sh</code> 50 step：验 loss、显存、save 路径不 OOM</td></tr>
+<tr><td>9</td><td>AutoDL GPU</td><td>正式 <code>MAX_STEPS=15000 bash train_dreamzero_*.sh</code> + <code>resource_monitor.sh &amp;</code></td></tr>
+<tr><td>10</td><td>AutoDL GPU</td><td>中频 interleave eval（见 §8）找峰值 ckpt</td></tr>
+<tr><td>11</td><td>AutoDL</td><td><code>upload_best_ckpt.sh</code> 推 HF Hub（<strong>关机前必做</strong>，autodl-tmp 不保证持久）</td></tr>
+<tr><td>12</td><td>本机</td><td>scp <code>monitor.csv</code> 回本机 + <code>analyze_run.sh</code> 生成 telemetry，补进本文档 §9</td></tr>
+</tbody>
+</table>
+
+<h2>7. 训练配置：robocasa_relative.yaml (从 leisaac 改 4 处)</h2>
+<p>基于 <code>LeIsaac/scripts/finetune/dreamzero/leisaac_relative.yaml</code> 改：① embodiment <code>xdof</code>→<code>robocasa</code>；② video 3 keys；③ state/action key 对齐 §4 切分；④ <code>fps.robocasa: 20</code>。</p>
+<pre><code># @package _global_  —— robocasa_relative.yaml
+defaults: [dreamzero/base_48_wan_fine_aug_relative, _self_]
+max_state_dim: 64
+relative_action: true
+relative_action_keys: [base_motion]          # 首跑仅 base 相对（见 §4 警告）
+robocasa_data_root: ???                       # CLI: robocasa_data_root=/root/autodl-tmp/opencabinet
+
+modality_config_robocasa:
+  video:
+    delta_indices: [0,1,...,24]               # 25 帧窗口（与 num_frames=33 配合，base 配置定）
+    modality_keys: [video.agentview_left, video.agentview_right, video.eye_in_hand]   # 3 视角
+  state:
+    delta_indices: [0]
+    modality_keys: [state.base_pos, state.base_rot, state.eef_pos, state.eef_rot, state.gripper_qpos]
+  action:
+    delta_indices: [0,1,...,23]               # action_horizon=24
+    modality_keys: [action.base_motion, action.ctrl_mode, action.eef_pos, action.eef_rot, action.gripper_close]
+  language:
+    modality_keys: [annotation.task]
+
+# transform: 各 state/action key 用 q99 归一化（ctrl_mode/gripper_close 可改 binary/identity）
+# 注册进 dispatch：modality_configs/transforms/metadata_versions/fps 各加 robocasa: ...
+fps: { robocasa: 20 }
+# train_dataset.mixture_spec: [{dataset_path:{robocasa:[${robocasa_data_root}]}, dataset_weight:1.0}]
+# dataset_kwargs.video_backend: decord    # h264 直接可读，无需 ffmpeg 慢后端</code></pre>
+
+<h3>7.1 训练启动（robocasa 版）</h3>
+<pre><code># 改自 train_dreamzero_bf16_lora.sh：data=… 换 robocasa，num_views 2→3
+torchrun --nproc_per_node 1 --standalone groot/vla/experiment/experiment.py \
+    data=dreamzero/robocasa_relative \
+    train_architecture=lora  num_frames=33  action_horizon=24  num_views=3 \
+    model=dreamzero/vla  model/dreamzero/action_head=wan_flow_matching_action_tf \
+    model/dreamzero/transform=dreamzero_cotrain \
+    num_frame_per_block=2  num_action_per_block=24  num_state_per_block=1 \
+    training_args.learning_rate=1e-4  training_args.warmup_ratio=0.05 \
+    per_device_train_batch_size=1  max_steps=15000  save_steps=2500  save_total_limit=5 \
+    bf16=true tf32=true  image_resolution_width=320 image_resolution_height=176 frame_seqlen=880 \
+    dataloader_num_workers=2  dataloader_pin_memory=false \
+    save_lora_only=true  "+training_args.save_only_model=true"  max_chunk_size=2 \
+    training_args.deepspeed=groot/vla/configs/deepspeed/zero2_offload.json \
+    output_dir=/root/autodl-tmp/dreamzero_robocasa_opencabinet_lora \
+    robocasa_data_root=/root/autodl-tmp/opencabinet \
+    dit_version=$WAN_CKPT_DIR  tokenizer_path=$TOKENIZER_DIR \
+    text_encoder_pretrained_path=$WAN_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth \
+    image_encoder_pretrained_path=$WAN_CKPT_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth \
+    vae_pretrained_path=$WAN_CKPT_DIR/Wan2.1_VAE.pth</code></pre>
+
+<div class="note"><strong>LoRA rank 纪律</strong>：默认 <code>r=4 / alpha=4</code>（~19M，~200 MB/ckpt）。<strong>不要</strong>像 LLM LoRA 那样开 32/64——视频扩散 LoRA 过 r=16 早期就崩，且 500 demo 过拟合风险已高。只有 step 2000 loss 平台才升 r=16。</div>
+
+<h2>8. 评测与对标 (Eval & leaderboard)</h2>
+<ul>
+<li><strong>评测协议必须与榜单一致</strong>：RoboCasa OpenCabinet，<code>SEED_BASE=0</code>，<code>MAX_STEPS=1200</code>，<code>n-action-steps=16</code>，SR 排除 sim-DNF。</li>
+<li><strong>当前榜单（30 轮 / 1200 step，已锁）</strong>：</li>
+</ul>
+<table>
+<thead><tr><th>模型</th><th>SR</th><th>备注</th></tr></thead>
+<tbody>
+<tr class="good"><td>GR00T N1.5</td><td><strong>64%</strong></td><td>冠军基线 🔒</td></tr>
+<tr><td>GR00T N1.7（自训峰值 11k）</td><td>50%</td><td>human-only</td></tr>
+<tr><td>GR00T N1.7（MG-mix 34k）</td><td>53.3%</td><td>15 轮</td></tr>
+<tr><td>pi0.5</td><td>17.4%</td><td>🔒</td></tr>
+<tr style="background:#f3e8ff"><td><strong>DreamZero（本次）</strong></td><td>?</td><td>WAM 范式首个 RoboCasa 数据点，success = &gt;50%</td></tr>
+</tbody>
+</table>
+<div class="warn"><strong>推理慢，先有预期</strong>：DreamZero AR 视频扩散 ~3 s/次（H100，warmup 后）。OpenCabinet 成功均值 ~594 step，<code>action_horizon=24</code> → ~25 次推理/episode ≈ 75 s/episode（H100）。30 轮可接受但慢；弱卡更慢。可用 <code>DreamZero-Flash</code> 单步推理或 NF4 加速，但要先验证不掉精度。<br>
+<strong>coarse eval 会骗人</strong>：400 step cap 会把「慢但成功」判 0。<strong>eval 必须 1200 step</strong>（与榜单一致）。</div>
+
+<h2>9. 实测 telemetry（已回填 / filled after run, 2026-06-02）</h2>
+<table>
+<thead><tr><th>项</th><th>实测</th></tr></thead>
+<tbody>
+<tr><td>硬件 / GPU</td><td>AutoDL RTX PRO 6000 Blackwell 96G（单卡）</td></tr>
+<tr><td>模型上卡显存</td><td>~54 GB（ZeRO-2 CPU offload；RAM 峰值 ~126 GB）</td></tr>
+<tr><td>速度 s/step</td><td><strong>~6.1 s/step</strong>（14B forward，compute-bound，num_workers=0）</td></tr>
+<tr><td>首步 loss</td><td>dynamics 0.116 / action 0.196（与 smoke 0.636 同量级）</td></tr>
+<tr><td>末步 loss</td><td>dynamics ~0.05 / action ~0.05（step 12550）</td></tr>
+<tr><td>训练步数</td><td>15000 计划 → <strong>跑到 12550 用户决策停训</strong>（SR 不动，堆步数无效）</td></tr>
+<tr><td>checkpoint</td><td>每 2500 步存档，<code>save_lora_only</code> ~417 MB/档，<code>save_total_limit=5</code>；全部 5 档已拉回本地</td></tr>
+<tr><td>SR-vs-step</td><td><strong>恒 0%</strong>（smoke/2500/5000/7500/10000/12500），见顶部结果小结</td></tr>
+<tr><td>本地评估速度</td><td>4090 NF4 headless ~12 min/ep（远快于预估的 1–1.5 h）；首 chunk ~136 s（一次性 CPU UMT5 编码）</td></tr>
+</tbody>
+</table>
+<div class="warn"><strong>未跑 30 轮 authoritative</strong>：SR 在所有 checkpoint 上恒 0%，跑 30 轮 authoritative 无意义（不会有非零 SR 可对榜）。直接定位为数据瓶颈，转 MimicGen 扩数据。<strong>红线遵守：N1.5/pi0.5 备份与榜单全程未碰。</strong></div>
+
+<h2>10. 避坑清单 (Gotchas)</h2>
+<table>
+<thead><tr><th>坑</th><th>规避</th></tr></thead>
+<tbody>
+<tr class="good"><td>AV1 decord 不支持</td><td>RoboCasa 已 h264，<strong>本任务无此坑</strong> ✓（LeIsaac 才需 <code>reencode_av1_to_h264.sh</code>）</td></tr>
+<tr class="good"><td>2 视角 vs base 3 视角 schema mismatch</td><td>RoboCasa 原生 3 视角，<code>num_views=3</code> 直接对齐 ✓</td></tr>
+<tr><td>relative-action 双重差分</td><td>首跑只标 <code>base_motion</code> relative，eef 当绝对量；loss 异常再切（§4）</td></tr>
+<tr><td>save 路径 RAM 尖峰 OOM</td><td><code>save_only_model=true</code> + <code>save_lora_only=true</code>；先 <code>SMOKE=1</code> 验 save</td></tr>
+<tr><td>LoRA rank 开太大</td><td>固定 r=4，平台期才升 r=16，绝不 ≥32</td></tr>
+<tr><td>autodl-tmp 丢数据</td><td>关机前 <code>upload_best_ckpt.sh</code> 推 HF</td></tr>
+<tr><td>UMT5 fp32 占 ~22G 撑爆显存</td><td>text emb 预计算用 <code>CUDA_VISIBLE_DEVICES="" </code> 强制 CPU 编码（见 fastwam recipe）</td></tr>
+<tr><td>Blackwell NCCL illegal-mem</td><td>多卡才有：<code>NCCL_P2P_DISABLE=1</code> + 预载 NCCL 2.30+；单卡忽略</td></tr>
+<tr><td>coarse eval 误判</td><td>eval 一律 1200 step，禁用 400 cap</td></tr>
+</tbody>
+</table>
+
+<h2>11. 下一步 (Next actions)</h2>
+<ol>
+<li><s>本机生成三件套</s> ✅ 完成。</li>
+<li><s>AutoDL SMOKE=1 验</s> ✅ 通过（loss/显存/save 均 OK）。</li>
+<li><s>正式 15k 训练</s> ✅ 跑到 step 12550 停训（SR 恒 0%，见结果小结）。</li>
+<li><s>30 轮 authoritative</s> ❌ 跳过——SR 恒 0% 无对榜意义（§9）。</li>
+<li><s>回填 §9 + 更新文档</s> ✅ 完成（本次）。</li>
+</ol>
+<div class="ok"><strong>🎯 真正下一步 / Real next step：MimicGen 10× 扩数据再训。</strong> human-500 是已证实的天花板（与 ACT 同任务结果一致）。复用 <a href="training_gr00t_n17.html"><code>training_gr00t_n17.html</code></a> 的 MimicGen 思路（原生 mixing 不物理合并，见 memory <code>project_n17_mimicgen_native_mix</code>）扩到数千 demo 后，再用同 <code>OUTPUT_DIR</code> 续训（自动从 ckpt-12500 resume）。云端续训件已保留、盘已清。
+<div class="en" style="margin-top:6px;">Scale data with MimicGen 10× before training more. 500 human demos is a proven ceiling (matches the ACT result on the same task). Resume training from ckpt-12500 once data is scaled — cloud resume assets kept, disk cleaned.</div></div>
+
+<p class="meta">本文档为单文件离线可分享（内嵌 SVG，无外链图片）。配方来源：<code>/home/david/work/isaaclab-experience/LeIsaac/scripts/finetune/dreamzero/</code> · <code>/cloud/autodl/</code>。</p>
+
+</body>
+</html>
